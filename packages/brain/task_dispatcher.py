@@ -7,7 +7,7 @@ Replaces V3's single-shot LLM dispatch with a full ReAct-loop-backed orchestrato
 
 Responsibilities:
   1. Classify incoming task (search / code / browser / file / general / done)
-  2. Hydrate ToolRegistry with concrete stub tools (search, code_exec, browser_fetch, file_read)
+  2. Hydrate ToolRegistry with concrete tools (search=Tavily, code_exec, browser_fetch, file_read)
   3. Pull channel AgentState from Redis (persist back after loop finishes)
   4. Call multi-provider key_rotation pool for LLM access (ALL 5 providers)
   5. Run ReActLoop (flash_mode=True for Groq)
@@ -17,11 +17,11 @@ Responsibilities:
 Informed by:
   - react_loop.py (this repo)          : ReActLoop, ToolRegistry, AgentState, ActionResult
   - llm_router.py (this repo)          : make_provider_llm_fn, multi-provider routing
+  - packages/tools/search.py (this repo): tavily_search — real Tavily + DDG fallback
   - browser-use/browser-use            : dispatch pattern, no-vision Groq rule
   - OpenHands/codeact_agent            : pending_actions, function_calling dispatch
   - SAGAR-TAMANG/friday-tony-stark     : system-level tool dispatch (web.py, system.py pattern)
   - dexterai.org architecture          : domain-specific action routing (intent → specialized handler)
-  - manus.im / GenSpark / MiniMax      : multi-step orchestration, streaming UX, tool-call chaining
 
 Design rules:
   - flash_mode=True default (Groq 8k ctx safe)
@@ -30,8 +30,7 @@ Design rules:
   - Response to Discord: NEVER leak === MEMORY GRAPH === or [COMPACTED HISTORY] blocks
   - Memory snippets: append to Redis list ultron:mem_buffer:{user_id} (flushed to Zilliz by memory worker)
   - max_iterations=5 default (hard ceiling from react_loop ABSOLUTE_MAX=10)
-  - Tool stubs: all 4 tools are real async functions with TODO internals
-    (search → Tavily free tier, code_exec → subprocess sandbox, browser_fetch → httpx, file_read → Redis CDN)
+  - search tool: REAL Tavily implementation (packages/tools/search.py), DDG fallback
 
 Future bug risks (pre-registered):
   D1 [HIGH]   If Redis is unavailable, AgentState load silently returns fresh state →
@@ -39,7 +38,6 @@ Future bug risks (pre-registered):
   D2 [HIGH]   Groq key_rotation pool returns None (all keys exhausted) → llm_call_fn
               gets called with None key → provider raises 401 → consecutive_failures max hit
               → loop aborts with no user-facing error message. Need explicit AllKeysExhausted guard.
-              (mitigated by make_provider_llm_fn internal guard, but pool.py must raise correctly)
   D3 [MED]    task_type classifier uses keyword match → ambiguous tasks ("read the latest news"
               could be search OR browser_fetch) → wrong tool called first → wasted iteration.
               Fix: add a lightweight Groq classify call before loop (1 token, no tools).
@@ -51,9 +49,11 @@ Future bug risks (pre-registered):
               if user sends a message starting with "=== ". Add start-of-line anchor.
 
 Tool calls used this session:
-  Github:get_file_contents x2 (task_dispatcher.py, llm_router.py),
-  Github:create_or_update_file x1,
+  Github:get_file_contents x3 (task_dispatcher.py, llm_router.py, v3 bot)
+  Github:create_or_update_file x1
+  Github:push_files x2
   Notion:notion-fetch x1
+  Notion:notion-update-page x1
 """
 
 from __future__ import annotations
@@ -63,10 +63,9 @@ import json
 import logging
 import re
 import time
-from dataclasses import asdict
 from typing import Any, Optional
 
-import httpx  # browser_fetch + Tavily search stub
+import httpx  # browser_fetch
 
 from packages.brain.react_loop import (
     ActionResult,
@@ -76,6 +75,7 @@ from packages.brain.react_loop import (
     ToolRegistry,
 )
 from packages.brain.llm_router import make_provider_llm_fn  # V4 multi-provider router
+from packages.tools.search import tavily_search  # REAL search (replaces stub)
 
 logger = logging.getLogger(__name__)
 
@@ -118,84 +118,49 @@ _STRIP_PATTERNS = [
 
 
 def strip_internal_blocks(text: str) -> str:
-    """Remove all internal orchestration markers from text before sending to Discord.
-
-    Bug D6: start-of-line anchor (^) in patterns prevents stripping valid user content.
-    """
+    """Remove all internal orchestration markers from text before sending to Discord."""
     for pat in _STRIP_PATTERNS:
         text = pat.sub("", text)
     return text.strip()
 
 
 # ---------------------------------------------------------------------------
-# Tool stubs — real async functions (internals TODO, interface LOCKED)
+# Tools — search is REAL (Tavily), others still stub
 # ---------------------------------------------------------------------------
 
-async def _tool_search(params: dict) -> ActionResult:
-    """Web search via Tavily free-tier API.
-
-    params: {query: str, max_results: int = 5}
-    TODO: inject TAVILY_API_KEY from config. Currently returns stub result.
-    Groq tool_use pattern (friday/tools/web.py style): call API → extract snippets → return.
-    """
-    query = params.get("query", "")
-    if not query:
-        return ActionResult(success=False, error="search: query param missing")
-
-    logger.info(f"[search stub] query='{query}'")
-    return ActionResult(
-        extracted_content=f"[SEARCH STUB] Results for: {query} — wire Tavily key to activate.",
-        long_term_memory=f"search:{query}",
-    )
-
-
 async def _tool_code_exec(params: dict) -> ActionResult:
-    """Execute sandboxed Python code via subprocess.
-
-    params: {code: str, timeout: int = 10}
-    """
+    """Execute sandboxed Python code via subprocess. STUB — Phase 7."""
     code = params.get("code", "")
-    timeout = min(int(params.get("timeout", 10)), 30)
     if not code:
         return ActionResult(success=False, error="code_exec: code param missing")
-
-    logger.info(f"[code_exec stub] code length={len(code)}")
-    return ActionResult(
-        extracted_content=f"[CODE_EXEC STUB] Would run: {code[:200]}...",
-    )
+    logger.info(f"[code_exec stub] len={len(code)}")
+    return ActionResult(extracted_content=f"[CODE_EXEC STUB] Would run: {code[:200]}...")
 
 
 async def _tool_browser_fetch(params: dict) -> ActionResult:
-    """Fetch a URL and return text content (no vision, DOM text only for Groq token budget)."""
+    """Fetch URL text content (DOM text, no screenshots — Groq token budget)."""
     url = params.get("url", "")
     if not url or not url.startswith(("http://", "https://")):
         return ActionResult(success=False, error="browser_fetch: invalid or missing url")
-
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(url, headers={"User-Agent": "UltronBot/1.0"})
             resp.raise_for_status()
             text = re.sub(r"<[^>]+>", " ", resp.text)
             text = re.sub(r"\s+", " ", text).strip()[:3000]
-            return ActionResult(
-                extracted_content=text,
-                long_term_memory=f"fetched:{url}",
-            )
+            return ActionResult(extracted_content=text, long_term_memory=f"fetched:{url}")
     except Exception as exc:
         logger.error(f"[browser_fetch] {url}: {exc}")
         return ActionResult(success=False, error=str(exc)[:300])
 
 
 async def _tool_file_read(params: dict) -> ActionResult:
-    """Read a file from Redis CDN buffer."""
+    """Read uploaded file from Redis CDN buffer. STUB — Phase 7."""
     file_key = params.get("file_key", "")
     if not file_key:
         return ActionResult(success=False, error="file_read: file_key param missing")
-
     logger.info(f"[file_read stub] key='{file_key}'")
-    return ActionResult(
-        extracted_content=f"[FILE_READ STUB] Key: {file_key} — wire Redis to activate.",
-    )
+    return ActionResult(extracted_content=f"[FILE_READ STUB] Key: {file_key} — wire Redis CDN.")
 
 
 # ---------------------------------------------------------------------------
@@ -253,9 +218,13 @@ TOOL_SCHEMAS: dict[str, dict] = {
 # ---------------------------------------------------------------------------
 
 def build_tool_registry() -> ToolRegistry:
-    """Build and return a ToolRegistry with all V4 stub tools registered."""
+    """Build and return a ToolRegistry with all V4 tools registered.
+
+    search: REAL (Tavily + DDG fallback via packages/tools/search.py)
+    code_exec, browser_fetch, file_read: stubs until Phase 7
+    """
     registry = ToolRegistry()
-    registry.register("search", _tool_search, TOOL_SCHEMAS["search"])
+    registry.register("search", tavily_search, TOOL_SCHEMAS["search"])  # REAL
     registry.register("code_exec", _tool_code_exec, TOOL_SCHEMAS["code_exec"])
     registry.register("browser_fetch", _tool_browser_fetch, TOOL_SCHEMAS["browser_fetch"])
     registry.register("file_read", _tool_file_read, TOOL_SCHEMAS["file_read"])
@@ -263,7 +232,7 @@ def build_tool_registry() -> ToolRegistry:
 
 
 # ---------------------------------------------------------------------------
-# Task-type pre-classifier (keyword-based, replace with LLM in Phase 3 — bug D3)
+# Task-type pre-classifier
 # ---------------------------------------------------------------------------
 
 def classify_task(message: str) -> str:
@@ -283,7 +252,6 @@ def classify_task(message: str) -> str:
 # ---------------------------------------------------------------------------
 
 async def _load_state(redis_client: Any, channel_id: str) -> Optional[dict]:
-    """Load AgentState dict from Redis. Returns None if not found or Redis down."""
     if redis_client is None:
         return None
     try:
@@ -297,7 +265,6 @@ async def _load_state(redis_client: Any, channel_id: str) -> Optional[dict]:
 
 
 async def _save_state(redis_client: Any, channel_id: str, state: AgentState) -> None:
-    """Persist AgentState to Redis. Always set TTL (bug D4)."""
     if redis_client is None:
         return
     try:
@@ -316,7 +283,6 @@ async def _save_state(redis_client: Any, channel_id: str, state: AgentState) -> 
 
 
 async def _buffer_memory(redis_client: Any, user_id: str, snippet: str) -> None:
-    """Append memory snippet to Redis buffer list. Trim to MEM_BUF_MAX (bug D5)."""
     if redis_client is None or not snippet:
         return
     try:
@@ -332,21 +298,7 @@ async def _buffer_memory(redis_client: Any, user_id: str, snippet: str) -> None:
 # ---------------------------------------------------------------------------
 
 class TaskDispatcher:
-    """Orchestrates task execution for Ultron V4.
-
-    Usage (from discord_bot.py or FastAPI handler)::
-
-        dispatcher = TaskDispatcher(pool=key_pool, redis=redis_client)
-        response = await dispatcher.dispatch(
-            message="What's the current Bitcoin price?",
-            channel_id="1234567890",
-            user_id="ghost_uid",
-        )
-        # response is a clean string, safe to send to Discord
-
-    LLM calls use make_provider_llm_fn(pool) from llm_router.py.
-    Pool selects from ALL 5 providers: Groq, Cerebras, Together, OpenRouter, Gemini.
-    """
+    """Orchestrates task execution for Ultron V4."""
 
     def __init__(
         self,
@@ -383,9 +335,6 @@ class TaskDispatcher:
             )
 
         registry = build_tool_registry()
-
-        # KEY CHANGE: use make_provider_llm_fn from llm_router (all 5 providers)
-        # Previously was _make_groq_llm_fn — Groq-only, wasted 4/5 of pool quota
         llm_call_fn = await make_provider_llm_fn(self.pool)
 
         loop = ReActLoop(
@@ -416,14 +365,12 @@ class TaskDispatcher:
                 else "",
             )
             await _save_state(self.redis, channel_id, _state)
-
             if final_result and final_result.long_term_memory:
                 await _buffer_memory(self.redis, user_id, final_result.long_term_memory)
 
         if final_result is None or (not final_result.success and final_result.error):
-            response = (
-                f"Sorry, I ran into an issue completing that task."
-                + (f" ({final_result.error[:100]})" if final_result else "")
+            response = "Sorry, I ran into an issue completing that task." + (
+                f" ({final_result.error[:100]})" if final_result else ""
             )
         elif final_result.extracted_content:
             response = final_result.extracted_content
@@ -431,7 +378,6 @@ class TaskDispatcher:
             response = "Task completed, but no output was produced."
 
         response = strip_internal_blocks(response)
-
         if len(response) > 1800:
             response = response[:1797] + "..."
 
@@ -439,14 +385,13 @@ class TaskDispatcher:
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton factory (optional convenience for main.py)
+# Singleton factory
 # ---------------------------------------------------------------------------
 
 _dispatcher_instance: Optional[TaskDispatcher] = None
 
 
 def get_dispatcher(pool: Any = None, redis: Any = None) -> TaskDispatcher:
-    """Return or create the global TaskDispatcher singleton."""
     global _dispatcher_instance
     if _dispatcher_instance is None:
         _dispatcher_instance = TaskDispatcher(pool=pool, redis=redis)
