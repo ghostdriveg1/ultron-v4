@@ -1,0 +1,40 @@
+# Ultron V4 — Python Dependencies
+# HuggingFace Spaces Docker (python:3.11-slim)
+
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+
+# HTTP client
+httpx==0.27.2
+
+# Discord
+discord.py==2.4.0
+
+# Redis (Upstash async compatible)
+redis==5.2.0
+
+# Embeddings — CPU-only torch (avoids 2.5GB CUDA download on HF Space)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.4.0+cpu
+sentence-transformers==3.2.1
+numpy==1.26.4
+
+# Browser automation (Playwright for browser_fetch + future browser_agent)
+playwright==1.48.0
+
+# Env loading (local dev only — HF Space uses Secrets)
+python-dotenv==1.0.1
+
+# File handling (multipart uploads to FastAPI)
+python-multipart==0.0.12
+
+# Async task queue (used by memory worker for Zilliz flush — Phase 3)
+# celery==5.4.0  # defer until Phase 3
+
+# Zilliz / Milvus client (Phase 3 memory pipeline)
+# pymilvus==2.4.9  # defer until Phase 3
+
+# Supabase (Phase 3 structured memory)
+# supabase==2.10.0  # defer until Phase 3
