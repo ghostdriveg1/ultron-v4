@@ -8,11 +8,13 @@ Startup sequence:
   2. KeyPool built from config_loader.build_pool_config()
   3. TaskDispatcher instantiated with pool
   4. Memory pipeline: Embedder + ZillizStore + RaptorTree + MemoryWorker
-  5. Background tasks: health-ping + memory flush worker
-  6. FastAPI app begins serving on port 7860 (HF Spaces standard)
+  5. Sentinel instantiated (if GEMINI_SENTINEL_KEY set)
+  6. Council instantiated (always — uses general pool)
+  7. Background tasks: health-ping + memory flush worker
+  8. FastAPI app begins serving on port 7860 (HF Spaces standard)
 
 Endpoints:
-  POST /infer          — Discord bot → Brain. Auth: X-Ultron-Token header.
+  POST /infer          — Discord bot -> Brain. Auth: X-Ultron-Token header.
   GET  /health         — CF Worker keep-alive + Sentinel audit. No auth.
   POST /sentinel/event — Sentinel writes incident/routing decision. Auth required.
 
@@ -27,24 +29,24 @@ Design decisions:
 Future bug risks (pre-registered):
   M1 [HIGH]   HF Spaces can spin up MULTIPLE workers for the same Space on scale events.
               app.state is per-worker — two workers get two independent KeyPool instances.
-              Both track failures independently → provider quotas burned 2x faster.
+              Both track failures independently -> provider quotas burned 2x faster.
               Fix (future): move failure state to Redis (pool P1) so all workers share.
 
   M2 [HIGH]   /infer has no request queuing. If 10 Discord messages arrive simultaneously,
-              10 ReAct loops start concurrently. Each uses 3-5 LLM calls → 30-50 concurrent
-              API hits → mass 429 storm. Fix: asyncio.Semaphore(max_concurrent=3) on /infer.
+              10 ReAct loops start concurrently. Each uses 3-5 LLM calls -> 30-50 concurrent
+              API hits -> mass 429 storm. Fix: asyncio.Semaphore(max_concurrent=3) on /infer.
 
   M3 [MED]    X-Ultron-Token comparison is timing-attack vulnerable (str == str).
               Fix: use hmac.compare_digest() instead. Low priority for free-tier.
 
   M4 [MED]    TaskDispatcher.dispatch() is assumed to be defined. If import fails
               (react_loop.py or llm_router.py has a bug), entire app crashes at startup.
-              Fix: wrap imports in try/except at startup → log error → fail with 503
+              Fix: wrap imports in try/except at startup -> log error -> fail with 503
               instead of silent crash.
 
-  M5 [LOW]    /sentinel/event accepts any JSON body currently. No schema validation.
-              A malformed payload from Sentinel (future) will KeyError inside the handler.
-              Fix: add Pydantic model for SentinelEvent when Sentinel layer is written.
+  M5 [LOW]    /sentinel/event SentinelEvent Pydantic model added (v22).
+              Now wired to sentinel.handle_event(). If Sentinel is INACTIVE
+              (no GEMINI_SENTINEL_KEY), event is logged only (no Gemini call).
 
   M6 [LOW]    Lifespan background task (health_ping) has no cancellation guard.
               If the task raises an exception, it dies silently — no restart.
@@ -60,7 +62,7 @@ Future bug risks (pre-registered):
 
   CL3 [MED]   llm_fn passed to RaptorTree is make_provider_llm_fn(pool). Pool may be
               exhausted when RAPTOR summariser calls it. AllKeysExhaustedError caught
-              in raptor.py._summarise_cluster() — returns None (partial tree).
+              in raptor.py._summarise_cluster() -> returns None (partial tree).
 
   CL4 [LOW]   Redis client in main.py lifespan created via redis.asyncio.from_url().
               If REDIS_URL not set, Redis init will fail at startup. Should degrade
@@ -69,6 +71,7 @@ Future bug risks (pre-registered):
 Tool calls used writing this file:
     Github:get_file_contents x1 (pool.py — confirmed KeyPool.status() shape)
     Github:get_file_contents x1 (task_dispatcher.py — confirmed TaskDispatcher.__init__ + dispatch sig)
+    Github:get_file_contents x1 (sentinel.py — confirmed build_sentinel() factory shape)
     External read: litellm proxy_server.py (lifespan pattern, startup sequence)
 """
 
@@ -123,7 +126,7 @@ class InferResponse(BaseModel):
 
 
 class SentinelEvent(BaseModel):
-    event_type: str            # "routing_decision" | "incident" | "health_check" | "weekly_audit"
+    event_type: str            # "space_failure" | "routing_override" | "health_check" | "weekly_audit" | "project_plan"
     payload: dict[str, Any]
     timestamp: Optional[float] = None
 
@@ -144,7 +147,7 @@ def _check_auth(request: Request, settings_token: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Background task: health ping (Sentinel keep-alive)
+# Background task: health ping (keep HF Space warm)
 # ---------------------------------------------------------------------------
 
 async def _health_ping_loop(brain_url: str, interval_seconds: int = 43200) -> None:
@@ -154,7 +157,7 @@ async def _health_ping_loop(brain_url: str, interval_seconds: int = 43200) -> No
         while True:
             try:
                 resp = await client.get(f"{brain_url}/health")
-                logger.debug(f"[HealthPing] self-ping → {resp.status_code}")
+                logger.debug(f"[HealthPing] self-ping -> {resp.status_code}")
             except Exception as e:
                 logger.warning(f"[HealthPing] self-ping failed: {e}")
             await asyncio.sleep(interval_seconds)
@@ -209,7 +212,6 @@ async def lifespan(app: FastAPI):
 
             memory_worker_task = asyncio.create_task(mem_worker.run())
 
-            # Store in app.state for future access (e.g. /infer memory inject)
             app.state.embedder     = embedder
             app.state.zilliz_store = zilliz_store
             app.state.raptor_tree  = raptor_tree
@@ -221,13 +223,48 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("[Startup] Memory pipeline DISABLED — ZILLIZ_URI/ZILLIZ_TOKEN/REDIS_URL not set")
 
-    # ── Step 6: Store core state ──────────────────────────────────────────
+        # Still init Redis alone for context windows + council state (if URL available)
+        if redis_url:
+            try:
+                import redis.asyncio as aioredis  # type: ignore
+                redis_client = aioredis.from_url(redis_url, decode_responses=False)
+                app.state.redis = redis_client
+                logger.info("[Startup] Redis-only client active (no Zilliz)")
+            except Exception as e:
+                logger.warning(f"[Startup] Redis init failed (non-fatal): {e}")
+
+    # ── Step 6: Sentinel (optional — degrades gracefully if key unset) ────
+    sentinel = None
+    try:
+        from packages.brain.sentinel import build_sentinel
+        sentinel = build_sentinel(settings)
+        if sentinel:
+            logger.info("[Startup] Sentinel: ACTIVE (Gemini 2.5 Pro dedicated key)")
+        else:
+            logger.warning("[Startup] Sentinel: INACTIVE (GEMINI_SENTINEL_KEY not set)")
+    except Exception as e:
+        logger.warning(f"[Startup] Sentinel init failed (non-fatal): {e}")
+
+    # ── Step 7: Council (always active — uses general pool) ───────────────
+    try:
+        from packages.brain.council import Council
+        council = Council(
+            pool=pool,
+            redis=getattr(app.state, "redis", None),
+        )
+        app.state.council = council
+        logger.info("[Startup] Council Mode: ACTIVE")
+    except Exception as e:
+        logger.warning(f"[Startup] Council init failed (non-fatal): {e}")
+
+    # ── Step 8: Store core state ──────────────────────────────────────────
     app.state.settings   = settings
     app.state.pool       = pool
     app.state.dispatcher = dispatcher
+    app.state.sentinel   = sentinel
     app.state.start_time = startup_start
 
-    # ── Step 7: Background health ping ────────────────────────────────────
+    # ── Step 9: Background health ping ────────────────────────────────────
     _brain_url = (
         "https://ghostdrive1-ultron1.hf.space"
         if not os.environ.get("LOCAL_DEV")
@@ -239,10 +276,9 @@ async def lifespan(app: FastAPI):
 
     elapsed = (time.monotonic() - startup_start) * 1000
     logger.info(
-        f"[Startup] Ultron V4 Brain ready in {elapsed:.1f}ms. "
-        f"Port={getattr(settings, 'brain_port', 7860)}. "
-        f"General keys={len(pool.general)}. "
-        f"Sentinel={'ACTIVE' if pool.sentinel else 'INACTIVE'}."
+        f"[Startup] Ultron V4 Brain READY in {elapsed:.1f}ms. "
+        f"Pool general={len(pool.general)} sentinel={'ACTIVE' if sentinel else 'INACTIVE'} "
+        f"council=ACTIVE memory={'ACTIVE' if memory_worker_task else 'INACTIVE'}"
     )
 
     # ── Yield: serve requests ─────────────────────────────────────────────
@@ -316,6 +352,8 @@ async def health(request: Request) -> JSONResponse:
         "uptime_seconds":     round(uptime, 1),
         "version":            "4.0.0",
         "memory_pipeline":    hasattr(request.app.state, "raptor_tree"),
+        "sentinel_active":    request.app.state.sentinel is not None,
+        "council_active":     hasattr(request.app.state, "council"),
         "pool": {
             "general_available":  pool_status["general_available"],
             "general_total":      len(pool_status["general"]),
@@ -327,10 +365,7 @@ async def health(request: Request) -> JSONResponse:
 
 @app.post("/infer", response_model=InferResponse)
 async def infer(body: InferRequest, request: Request) -> InferResponse:
-    """Main Discord → Brain endpoint.
-
-    Bug M2: no concurrency cap. Add asyncio.Semaphore in next session.
-    """
+    """Main Discord -> Brain endpoint."""
     req_id  = getattr(request.state, "request_id", "?")
     t_start = time.monotonic()
 
@@ -372,16 +407,45 @@ async def infer(body: InferRequest, request: Request) -> InferResponse:
 
 @app.post("/sentinel/event")
 async def sentinel_event(body: SentinelEvent, request: Request) -> JSONResponse:
-    """Sentinel writes routing decisions and incident reports here. Full wiring in Phase 4."""
+    """
+    Sentinel writes routing decisions and incident reports here.
+    Fully wired in v22: delegates to Sentinel.handle_event() if Sentinel active.
+    If Sentinel inactive (no GEMINI_SENTINEL_KEY), logs event and returns 200.
+    """
     settings = request.app.state.settings
     _check_auth(request, getattr(settings, "ultron_auth_token", ""))
 
-    ts = body.timestamp or time.time()
+    ts       = body.timestamp or time.time()
+    sentinel = request.app.state.sentinel
+
     logger.info(
         f"[Sentinel] event_type={body.event_type} "
         f"ts={ts:.0f} payload_keys={list(body.payload.keys())}"
     )
-    return JSONResponse({"status": "received", "event_type": body.event_type})
+
+    if sentinel is None:
+        logger.warning(
+            f"[Sentinel] Event received but Sentinel INACTIVE "
+            f"(GEMINI_SENTINEL_KEY not set). event_type={body.event_type}"
+        )
+        return JSONResponse({
+            "status": "logged_only",
+            "reason": "Sentinel inactive — set GEMINI_SENTINEL_KEY",
+            "event_type": body.event_type,
+        })
+
+    try:
+        result = await sentinel.handle_event(
+            event_type=body.event_type,
+            payload=body.payload,
+        )
+        return JSONResponse({"status": "ok", "event_type": body.event_type, **result})
+    except Exception as e:
+        logger.error(f"[Sentinel] handle_event failed: {e}")
+        return JSONResponse(
+            {"status": "error", "error": str(e), "event_type": body.event_type},
+            status_code=500,
+        )
 
 
 # ---------------------------------------------------------------------------
