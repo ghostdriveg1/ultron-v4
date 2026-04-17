@@ -30,11 +30,12 @@ python-dotenv==1.0.1
 # File handling (multipart uploads to FastAPI)
 python-multipart==0.0.12
 
-# Async task queue (used by memory worker for Zilliz flush — Phase 3)
-# celery==5.4.0  # defer until Phase 3
+# Phase 3: Memory pipeline — Zilliz / Milvus
+pymilvus==2.4.9
 
-# Zilliz / Milvus client (Phase 3 memory pipeline)
-# pymilvus==2.4.9  # defer until Phase 3
+# Phase 3: RAPTOR clustering deps
+umap-learn==0.5.6
+scikit-learn==1.5.2
 
-# Supabase (Phase 3 structured memory)
-# supabase==2.10.0  # defer until Phase 3
+# Supabase (Phase 4 structured memory — deferred)
+# supabase==2.10.0
