@@ -1,0 +1,10 @@
+name = "ultron-api"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+BRAIN_URL = "https://ghostdrive1-ultron1.hf.space"
+
+# Secrets — set via CLI:
+#   npx wrangler secret put AUTH_TOKEN
+# (use the same token as Brain auth: de76095c6d76...)
