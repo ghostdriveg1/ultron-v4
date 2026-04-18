@@ -1,0 +1,32 @@
+# Voice Space dependencies
+# ── Core ──────────────────────────────────
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+pydantic==2.11.3
+
+# ── STT: Groq Whisper (whisper-large-v3-turbo) ──
+groq==0.23.1
+
+# ── TTS: Kokoro-82M ──
+kokoro>=0.9.2
+soundfile==0.12.1
+numpy==1.26.4
+
+# ── Voice Activity Detection ──
+webrtcvad==2.0.10
+
+# ── LiveKit WebRTC (VP2 fix) ──
+livekit==0.12.0
+livekit-api==0.7.1
+
+# ── Discord voice receive (VP1) ──
+discord.py[voice]==2.3.2
+PyNaCl==1.5.0
+
+# ── Streaming pipeline (pipecat reference) ──
+aiohttp==3.11.14
+asyncio-mqtt==0.16.2
+
+# ── Redis context ──
+redis==5.2.0
