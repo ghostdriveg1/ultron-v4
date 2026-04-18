@@ -3,7 +3,7 @@ packages/brain/discord_bot.py
 
 Ultron V4 — Discord Interface Layer
 =====================================
-Thin bot that bridges Discord ↔ FastAPI Brain (/infer endpoint).
+Thin bot that bridges Discord <-> FastAPI Brain (/infer endpoint).
 Never calls TaskDispatcher or LLM directly — Brain is the only LLM surface.
 
 Features (V4 over V3):
@@ -15,6 +15,7 @@ Features (V4 over V3):
   - Rate-limit: 10 req/min per user (in-memory sliding window)
   - No internal block leaks: strip_internal_blocks applied on ALL responses
   - No fake behaviors: if Brain returns error, say so plainly
+  - LifecycleEngine.ingest() called on every user message (v25)
 
 V4 design rules:
   - Bot is stateless except for rate-limit counters and Redis context writes
@@ -24,24 +25,26 @@ V4 design rules:
   - NEVER send === MEMORY GRAPH === or [COMPACTED HISTORY] blocks to user
 
 Future bug risks (pre-registered):
-  BOT1 [HIGH]   Redis context write fails silently → context window empty → B1/D1 fire
+  BOT1 [HIGH]   Redis context write fails silently -> context window empty -> B1/D1 fire
                 Fix: log warning, continue without context (degrade gracefully)
-  BOT2 [HIGH]   Discord rate-limit on bulk sends (5+ chunks in 1s) → 429 from Discord API
+  BOT2 [HIGH]   Discord rate-limit on bulk sends (5+ chunks in 1s) -> 429 from Discord API
                 Fix: asyncio.sleep(0.5) between chunks if len(chunks) > 2
-  BOT3 [MED]    Brain /health timeout on !status → bot hangs under slow HF Space wake
+  BOT3 [MED]    Brain /health timeout on !status -> bot hangs under slow HF Space wake
                 Fix: timeout=8s on health check, return "Brain waking..." on timeout
-  BOT4 [MED]    ALLOWED_USERS env parsed at import → adding user requires restart
+  BOT4 [MED]    ALLOWED_USERS env parsed at import -> adding user requires restart
                 Fix: re-parse on each message (minimal perf cost, big ops win)
-  BOT5 [LOW]    on_message fires for bot's own replies (if intents wrong) → infinite loop
+  BOT5 [LOW]    on_message fires for bot's own replies (if intents wrong) -> infinite loop
                 Fix: if msg.author == bot.user: return — MUST be first check
-  BOT6 [LOW]    Context window RPUSH/LTRIM non-atomic → concurrent messages corrupt window
+  BOT6 [LOW]    Context window RPUSH/LTRIM non-atomic -> concurrent messages corrupt window
                 Fix: use Redis pipeline() for atomic push+trim pair
+  BOT7 [MED]    lifecycle.ingest() called per message but user_id != channel_id in lifecycle
+                keys. If lifecycle.get_stm(user_id) called with channel_id from /memory/stm,
+                returns empty list. Fix: pass user_id to ingest, not channel_id as proxy.
+                (Tracked as CL5 in main.py — lifecycle stores cells per user_id)
 
-Tool calls used this session:
-  Github:get_file_contents x4 (task_dispatcher.py, v3 discord_bot.py, v3 root, v3 packages/bot)
-  Github:push_files x1
-  Notion:notion-fetch x1
-  Notion:notion-update-page x1
+Tool calls used this session (v25):
+  Github:get_file_contents x1 (discord_bot.py current state + sha)
+  Github:get_file_contents x1 (lifecycle.py interface — ingest signature)
 """
 
 from __future__ import annotations
@@ -151,16 +154,16 @@ async def _call_brain(
                 json=payload,
             )
         if r.status_code == 429:
-            return {"error": "⚠️ Rate limited. Try again in a moment."}
+            return {"error": "\u26a0\ufe0f Rate limited. Try again in a moment."}
         if r.status_code == 503:
-            return {"error": "⚠️ All LLM keys exhausted. Try again later."}
+            return {"error": "\u26a0\ufe0f All LLM keys exhausted. Try again later."}
         if r.status_code == 401:
-            return {"error": "⛔ Auth failed. Check INTERNAL_AUTH_TOKEN."}
+            return {"error": "\u26d4 Auth failed. Check INTERNAL_AUTH_TOKEN."}
         if r.status_code not in (200, 201):
             return {"error": f"Brain {r.status_code}: {r.text[:200]}"}
         return r.json()
     except httpx.TimeoutException:
-        return {"error": "⏱️ Brain timed out. HF Space may be waking up — try again in 30s."}
+        return {"error": "\u23f1\ufe0f Brain timed out. HF Space may be waking up — try again in 30s."}
     except Exception as exc:
         logger.exception(f"[Bot] _call_brain {path} failed: {exc}")
         return {"error": f"Bot error: {str(exc)[:200]}"}
@@ -214,6 +217,34 @@ async def _ctx_get(redis, channel_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle ingest helper
+# ---------------------------------------------------------------------------
+
+async def _lifecycle_ingest(
+    lifecycle,
+    user_id: str,
+    channel_id: str,
+    text: str,
+    metadata: Optional[dict] = None,
+) -> None:
+    """
+    Fire lifecycle.ingest() as best-effort background call.
+    Never raises — BOT7 mitigation: pass user_id (not channel_id) as the lifecycle key.
+    """
+    if lifecycle is None:
+        return
+    try:
+        await lifecycle.ingest(
+            user_id=user_id,
+            channel_id=channel_id,
+            raw_text=text,
+            metadata=metadata or {},
+        )
+    except Exception as exc:
+        logger.warning(f"[Bot] lifecycle.ingest failed (non-fatal): {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 
@@ -233,20 +264,21 @@ async def _cmd_status(msg: discord.Message, user_id: str) -> None:
     async with msg.channel.typing():
         data = await _get_health(user_id)
     if "error" in data:
-        await msg.reply(f"⚠️ {data['error']}")
+        await msg.reply(f"\u26a0\ufe0f {data['error']}")
         return
     pool = data.get("pool", {})
     total = pool.get("total", 0)
     available = pool.get("available", 0)
     uptime = data.get("uptime_seconds", 0)
     uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m"
+    lifecycle_status = "\u2705" if data.get("lifecycle_active") else "\u274c"
     lines = [
-        f"**Ultron V4** | Uptime: {uptime_str} | Keys: {available}/{total}",
+        f"**Ultron V4** | Uptime: {uptime_str} | Keys: {available}/{total} | Lifecycle: {lifecycle_status}",
     ]
     # Show per-provider pool summary if available
     providers = pool.get("providers", {})
     for provider, stats in providers.items():
-        avail_icon = "✅" if stats.get("available", 0) > 0 else "❌"
+        avail_icon = "\u2705" if stats.get("available", 0) > 0 else "\u274c"
         lines.append(f"  {avail_icon} `{provider}` — {stats.get('available', 0)}/{stats.get('total', 0)} keys")
     await msg.reply("\n".join(lines))
 
@@ -274,7 +306,7 @@ async def _cmd_council(msg: discord.Message, user_id: str, args: str) -> None:
     if not args:
         await msg.reply("Usage: `!council <project brief>`")
         return
-    await msg.reply("⚡ Assembling council... (~30-60s)")
+    await msg.reply("\u26a1 Assembling council... (~30-60s)")
     async with msg.channel.typing():
         result = await _call_brain(
             "/council",
@@ -283,7 +315,7 @@ async def _cmd_council(msg: discord.Message, user_id: str, args: str) -> None:
             timeout=120.0,
         )
     synthesis = _strip(result.get("synthesis", result.get("error", "Council failed.")))
-    header = "**⚡ Council Report:**\n"
+    header = "**\u26a1 Council Report:**\n"
     chunks = _chunk(header + synthesis)
     for i, c in enumerate(chunks):
         if i > 0:
@@ -297,24 +329,26 @@ async def _cmd_clear(msg: discord.Message, redis, channel_id: str) -> None:
             await redis.delete(f"{CTX_KEY_PREFIX}{channel_id}")
         except Exception as exc:
             logger.warning(f"[Bot] ctx clear failed: {exc}")
-    await msg.reply("🗑️ Channel context cleared.")
+    await msg.reply("\U0001f5d1\ufe0f Channel context cleared.")
 
 
 async def _cmd_ping(msg: discord.Message) -> None:
     latency_ms = round(msg._state._get_websocket(msg.guild).latency * 1000)
-    await msg.reply(f"🏓 Pong! Latency: {latency_ms}ms")
+    await msg.reply(f"\U0001f3d3 Pong! Latency: {latency_ms}ms")
 
 
 # ---------------------------------------------------------------------------
 # Bot setup
 # ---------------------------------------------------------------------------
 
-def build_bot(redis=None) -> discord.Client:
+def build_bot(redis=None, lifecycle=None) -> discord.Client:
     """Build and return the Discord client.
 
     Args:
         redis: Optional async Redis client (e.g. upstash_redis.Redis or aioredis.Redis).
                If None, context window is disabled but bot still works.
+        lifecycle: Optional LifecycleEngine instance. If set, ingest() is called on
+                   every user message for STM/MTM/Foresight pipeline. (v25)
     """
     intents = discord.Intents.default()
     intents.message_content = True
@@ -344,7 +378,7 @@ def build_bot(redis=None) -> discord.Client:
 
         # Rate limit
         if _is_rate_limited(user_id):
-            await msg.reply("⚠️ Slow down — max 10 messages/minute.")
+            await msg.reply("\u26a0\ufe0f Slow down — max 10 messages/minute.")
             return
 
         channel_id = str(msg.channel.id)
@@ -382,6 +416,18 @@ def build_bot(redis=None) -> discord.Client:
 
         full_message = content + attachment_info
 
+        # Fire lifecycle.ingest() as non-blocking background task (v25)
+        # BOT7: pass user_id as lifecycle key, channel_id for context grouping
+        asyncio.create_task(
+            _lifecycle_ingest(
+                lifecycle,
+                user_id=user_id,
+                channel_id=channel_id,
+                text=full_message,
+                metadata={"source": "discord", "username": str(msg.author)},
+            )
+        )
+
         # Save user message to context window BEFORE call
         await _ctx_append(redis, channel_id, "user", full_message)
 
@@ -409,6 +455,17 @@ def build_bot(redis=None) -> discord.Client:
         # Save bot response to context window
         await _ctx_append(redis, channel_id, "assistant", response[:500])
 
+        # Also ingest bot response into lifecycle (for Foresight context)
+        asyncio.create_task(
+            _lifecycle_ingest(
+                lifecycle,
+                user_id=user_id,
+                channel_id=channel_id,
+                text=f"[ULTRON RESPONSE] {response[:500]}",
+                metadata={"source": "discord_response"},
+            )
+        )
+
         # Send chunked
         chunks = _chunk(response)
         for i, chunk in enumerate(chunks):
@@ -426,11 +483,11 @@ def build_bot(redis=None) -> discord.Client:
 # Runner
 # ---------------------------------------------------------------------------
 
-def run(redis=None) -> None:
+def run(redis=None, lifecycle=None) -> None:
     """Start the Discord bot. Called from main.py lifespan or standalone."""
     if not DISCORD_BOT_TOKEN:
         logger.error("[Bot] DISCORD_BOT_TOKEN not set — bot disabled")
         print("[ERROR] DISCORD_BOT_TOKEN not set", file=sys.stderr)
         return
-    bot = build_bot(redis=redis)
+    bot = build_bot(redis=redis, lifecycle=lifecycle)
     bot.run(DISCORD_BOT_TOKEN, log_handler=None)  # logging already configured

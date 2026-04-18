@@ -8,15 +8,19 @@ Startup sequence:
   2. KeyPool built from config_loader.build_pool_config()
   3. TaskDispatcher instantiated with pool
   4. Memory pipeline: Embedder + ZillizStore + RaptorTree + MemoryWorker
-  5. Sentinel instantiated (if GEMINI_SENTINEL_KEY set)
-  6. Council instantiated (always — uses general pool)
-  7. Background tasks: health-ping + memory flush worker
-  8. FastAPI app begins serving on port 7860 (HF Spaces standard)
+  5. LifecycleEngine + GroundTruthStore + RDLoop (if Redis available)
+  6. Sentinel instantiated (if GEMINI_SENTINEL_KEY set)
+  7. Council instantiated (always — uses general pool)
+  8. Background tasks: health-ping + memory flush worker
+  9. FastAPI app begins serving on port 7860 (HF Spaces standard)
 
 Endpoints:
-  POST /infer          — Discord bot -> Brain. Auth: X-Ultron-Token header.
-  GET  /health         — CF Worker keep-alive + Sentinel audit. No auth.
-  POST /sentinel/event — Sentinel writes incident/routing decision. Auth required.
+  POST /infer                   — Discord bot -> Brain. Auth: X-Ultron-Token header.
+  GET  /health                  — CF Worker keep-alive + Sentinel audit. No auth.
+  POST /sentinel/event          — Sentinel writes incident/routing decision. Auth required.
+  GET  /keys                    — Pool status + key counts per provider (website dashboard).
+  GET  /memory/stm/{channel_id} — Redis STM context viewer for website Memory tab.
+  GET  /rd/history/{user_id}    — R&D loop implemented improvements for website.
 
 Design decisions:
   - asynccontextmanager lifespan (FastAPI 0.93+ pattern). No @app.on_event.
@@ -68,23 +72,33 @@ Future bug risks (pre-registered):
               If REDIS_URL not set, Redis init will fail at startup. Should degrade
               gracefully (disable memory worker) rather than crash entire Brain.
 
-Tool calls used writing this file:
-    Github:get_file_contents x1 (pool.py — confirmed KeyPool.status() shape)
-    Github:get_file_contents x1 (task_dispatcher.py — confirmed TaskDispatcher.__init__ + dispatch sig)
-    Github:get_file_contents x1 (sentinel.py — confirmed build_sentinel() factory shape)
-    External read: litellm proxy_server.py (lifespan pattern, startup sequence)
+  CL5 [MED]   LifecycleEngine._locks dict grows unbounded across users in long-running
+              process. Each new user_id adds an asyncio.Lock. In high-traffic scenarios
+              (100+ users) this leaks memory. Fix: use WeakValueDictionary or LRU cache.
+
+  CL6 [LOW]   RDLoop.run() is not started as a background task in main.py — it is
+              triggered externally (post-task completion). If called from /infer handler,
+              it blocks the response. Fix: always asyncio.create_task() for RDLoop.run().
+
+Tool calls used writing this file (v25):
+    Github:get_file_contents x1 (lifecycle.py interface)
+    Github:get_file_contents x1 (ground_truth.py interface)
+    Github:get_file_contents x1 (rd_loop.py interface)
+    Github:get_file_contents x1 (main.py current state + sha)
+    pipecat-ai/pipecat: src/pipecat/services/groq/stt.py (Whisper API pattern)
 """
 
 from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -187,6 +201,13 @@ async def lifespan(app: FastAPI):
     # ── Step 4: TaskDispatcher ────────────────────────────────────────────
     dispatcher = TaskDispatcher(pool=pool, settings=settings)
 
+    # ── Resolve brain_url early (needed by RDLoop + health ping) ──────────
+    _brain_url = (
+        "https://ghostdrive1-ultron1.hf.space"
+        if not os.environ.get("LOCAL_DEV")
+        else f"http://localhost:{getattr(settings, 'brain_port', 7860)}"
+    )
+
     # ── Step 5: Memory pipeline (optional — degrades gracefully if Zilliz unset) ──
     memory_worker_task: Optional[asyncio.Task] = None
     redis_client = None
@@ -233,6 +254,39 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.warning(f"[Startup] Redis init failed (non-fatal): {e}")
 
+    # ── Step 5b: Lifecycle + GroundTruth + RDLoop (optional — needs Redis) ──
+    lifecycle = None
+    gt_store  = None
+    rd_loop   = None
+
+    if redis_client is not None:
+        try:
+            from packages.memory.lifecycle import LifecycleEngine
+            from packages.memory.ground_truth import GroundTruthStore
+            from packages.brain.rd_loop import RDLoop
+
+            discord_webhook = os.environ.get("DISCORD_WEBHOOK_URL", "") or None
+
+            lifecycle = LifecycleEngine(redis_client)
+            gt_store  = GroundTruthStore(redis_client)
+            rd_loop   = RDLoop(
+                redis_client=redis_client,
+                lifecycle=lifecycle,
+                brain_url=_brain_url,
+                auth_token=getattr(settings, "ultron_auth_token", ""),
+                discord_webhook=discord_webhook,
+            )
+
+            app.state.lifecycle = lifecycle
+            app.state.gt_store  = gt_store
+            app.state.rd_loop   = rd_loop
+
+            logger.info("[Startup] LifecycleEngine + GroundTruthStore + RDLoop: ACTIVE")
+        except Exception as e:
+            logger.warning(f"[Startup] Lifecycle/GT/RDLoop init failed (non-fatal): {e}")
+    else:
+        logger.warning("[Startup] Lifecycle/GT/RDLoop DISABLED — Redis not available")
+
     # ── Step 6: Sentinel (optional — degrades gracefully if key unset) ────
     sentinel = None
     try:
@@ -265,20 +319,17 @@ async def lifespan(app: FastAPI):
     app.state.start_time = startup_start
 
     # ── Step 9: Background health ping ────────────────────────────────────
-    _brain_url = (
-        "https://ghostdrive1-ultron1.hf.space"
-        if not os.environ.get("LOCAL_DEV")
-        else f"http://localhost:{getattr(settings, 'brain_port', 7860)}"
-    )
     _ping_task = asyncio.create_task(
         _health_ping_loop(_brain_url, interval_seconds=43200)
     )
 
     elapsed = (time.monotonic() - startup_start) * 1000
+    lifecycle_active = hasattr(app.state, "lifecycle") and app.state.lifecycle is not None
     logger.info(
         f"[Startup] Ultron V4 Brain READY in {elapsed:.1f}ms. "
         f"Pool general={len(pool.general)} sentinel={'ACTIVE' if sentinel else 'INACTIVE'} "
-        f"council=ACTIVE memory={'ACTIVE' if memory_worker_task else 'INACTIVE'}"
+        f"council=ACTIVE memory={'ACTIVE' if memory_worker_task else 'INACTIVE'} "
+        f"lifecycle={'ACTIVE' if lifecycle_active else 'INACTIVE'}"
     )
 
     # ── Yield: serve requests ─────────────────────────────────────────────
@@ -354,6 +405,7 @@ async def health(request: Request) -> JSONResponse:
         "memory_pipeline":    hasattr(request.app.state, "raptor_tree"),
         "sentinel_active":    request.app.state.sentinel is not None,
         "council_active":     hasattr(request.app.state, "council"),
+        "lifecycle_active":   hasattr(request.app.state, "lifecycle") and request.app.state.lifecycle is not None,
         "pool": {
             "general_available":  pool_status["general_available"],
             "general_total":      len(pool_status["general"]),
@@ -373,6 +425,18 @@ async def infer(body: InferRequest, request: Request) -> InferResponse:
     _check_auth(request, getattr(settings, "ultron_auth_token", ""))
 
     dispatcher: TaskDispatcher = request.app.state.dispatcher
+
+    # Fire lifecycle.ingest() as background task (non-blocking) — CL6 mitigation
+    lifecycle = getattr(request.app.state, "lifecycle", None)
+    if lifecycle is not None:
+        asyncio.create_task(
+            lifecycle.ingest(
+                user_id=body.user_id,
+                channel_id=body.channel_id,
+                raw_text=body.message,
+                metadata={"source": "infer", "username": body.username or "user"},
+            )
+        )
 
     try:
         reply = await dispatcher.dispatch(
@@ -446,6 +510,126 @@ async def sentinel_event(body: SentinelEvent, request: Request) -> JSONResponse:
             {"status": "error", "error": str(e), "event_type": body.event_type},
             status_code=500,
         )
+
+
+# ---------------------------------------------------------------------------
+# Website API endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/keys")
+async def keys_status(request: Request) -> JSONResponse:
+    """
+    Returns per-provider key pool status for the website Credentials dashboard.
+    Auth required.
+    """
+    settings = request.app.state.settings
+    _check_auth(request, getattr(settings, "ultron_auth_token", ""))
+
+    pool: KeyPool = request.app.state.pool
+    pool_status = await pool.status()
+
+    # Build per-provider breakdown
+    providers: dict[str, dict] = {}
+    for key_info in pool_status.get("general", []):
+        provider = key_info.get("provider", "unknown")
+        if provider not in providers:
+            providers[provider] = {"total": 0, "available": 0, "in_cooldown": 0}
+        providers[provider]["total"] += 1
+        if key_info.get("available", False):
+            providers[provider]["available"] += 1
+        else:
+            providers[provider]["in_cooldown"] += 1
+
+    sentinel_keys = pool_status.get("sentinel", [])
+    sentinel_available = sum(1 for k in sentinel_keys if k.get("available", False))
+
+    return JSONResponse({
+        "general": {
+            "providers": providers,
+            "total": len(pool_status.get("general", [])),
+            "available": pool_status.get("general_available", 0),
+        },
+        "sentinel": {
+            "total": len(sentinel_keys),
+            "available": sentinel_available,
+        },
+    })
+
+
+@app.get("/memory/stm/{channel_id}")
+async def memory_stm(channel_id: str, request: Request) -> JSONResponse:
+    """
+    Returns the STM (short-term memory) context for a channel.
+    Used by website Memory tab — STM view.
+    Auth required.
+    """
+    settings = request.app.state.settings
+    _check_auth(request, getattr(settings, "ultron_auth_token", ""))
+
+    redis = getattr(request.app.state, "redis", None)
+    if redis is None:
+        return JSONResponse({"error": "Redis not available"}, status_code=503)
+
+    # Read raw Redis context window (set by discord_bot.py)
+    ctx_key = f"ultron:ctx:{channel_id}"
+    try:
+        entries = await redis.lrange(ctx_key, 0, -1)
+        messages = [
+            e.decode() if isinstance(e, bytes) else e
+            for e in entries
+        ]
+    except Exception as e:
+        logger.warning(f"[/memory/stm] Redis read failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    # Also return lifecycle STM if available
+    lifecycle = getattr(request.app.state, "lifecycle", None)
+    lifecycle_cells: List[dict] = []
+    if lifecycle is not None:
+        try:
+            # Use channel_id as user_id proxy for STM lookup (cells stored per user_id)
+            cells = await lifecycle.get_stm(channel_id)
+            lifecycle_cells = [c.to_dict() for c in cells]
+        except Exception as e:
+            logger.warning(f"[/memory/stm] lifecycle.get_stm failed: {e}")
+
+    return JSONResponse({
+        "channel_id": channel_id,
+        "context_window": messages,
+        "context_window_count": len(messages),
+        "lifecycle_cells": lifecycle_cells,
+        "lifecycle_cell_count": len(lifecycle_cells),
+    })
+
+
+@app.get("/rd/history/{user_id}")
+async def rd_history(user_id: str, request: Request) -> JSONResponse:
+    """
+    Returns the R&D loop implemented improvements for a user.
+    Used by website Projects tab — R&D history view.
+    Auth required.
+    """
+    settings = request.app.state.settings
+    _check_auth(request, getattr(settings, "ultron_auth_token", ""))
+
+    rd_loop = getattr(request.app.state, "rd_loop", None)
+    if rd_loop is None:
+        return JSONResponse({"error": "RDLoop not initialized — Redis required"}, status_code=503)
+
+    try:
+        limit = int(request.query_params.get("limit", 20))
+        improvements = await rd_loop.get_history(user_id, limit=limit)
+        state = await rd_loop.get_state(user_id)
+    except Exception as e:
+        logger.warning(f"[/rd/history] failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    return JSONResponse({
+        "user_id": user_id,
+        "improvements": [i.to_dict() for i in improvements],
+        "improvement_count": len(improvements),
+        "rd_state": state.to_dict() if state else None,
+    })
 
 
 # ---------------------------------------------------------------------------
