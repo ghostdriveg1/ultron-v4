@@ -1,3 +1,7 @@
+// website/src/lib/api.js
+// All API calls proxied through CF API Worker → Brain
+// Worker URL: https://ultron-api.ghostdriveg1.workers.dev
+
 const API_BASE = import.meta.env.VITE_API_URL || 'https://ultron-api.ghostdriveg1.workers.dev';
 const AUTH_TOKEN = import.meta.env.VITE_AUTH_TOKEN || '';
 
@@ -6,6 +10,7 @@ async function request(path, options = {}) {
     ...options,
     headers: {
       'Content-Type': 'application/json',
+      'X-Ultron-Token': AUTH_TOKEN,
       Authorization: `Bearer ${AUTH_TOKEN}`,
       ...options.headers,
     },
@@ -15,31 +20,38 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  health: () => request('/api/health'),
+  // ── Brain health (includes pool + lifecycle + promoter status) ────────
+  health: () => request('/health'),
 
+  // ── Infer (direct to brain) ───────────────────────────────────────────
   infer: (payload) =>
-    request('/api/infer', { method: 'POST', body: JSON.stringify(payload) }),
+    request('/infer', { method: 'POST', body: JSON.stringify(payload) }),
 
+  // ── Key pool ──────────────────────────────────────────────────────────
   keys: {
-    list: () => request('/api/keys'),
-    add: (key) => request('/api/keys', { method: 'POST', body: JSON.stringify(key) }),
-    remove: (keyId) => request(`/api/keys/${keyId}`, { method: 'DELETE' }),
+    status: () => request('/keys'),
   },
 
+  // ── Sentinel ──────────────────────────────────────────────────────────
   sentinel: {
-    trigger: (type) =>
-      request('/api/sentinel/event', {
+    trigger: (eventType, payload = {}) =>
+      request('/sentinel/event', {
         method: 'POST',
-        body: JSON.stringify({ type, source: 'website' }),
+        body: JSON.stringify({
+          event_type: eventType,
+          payload: { source: 'website', ...payload },
+        }),
       }),
-    reports: () => request('/api/sentinel/reports'),
   },
 
+  // ── Memory ────────────────────────────────────────────────────────────
   memory: {
-    stm: (channelId) => request(`/api/memory/stm/${channelId}`),
+    stm: (channelId) => request(`/memory/stm/${channelId}`),
   },
 
-  projects: {
-    list: () => request('/api/projects'),
+  // ── R&D loop history ─────────────────────────────────────────────────
+  rd: {
+    history: (userId, limit = 30) =>
+      request(`/rd/history/${userId}?limit=${limit}`),
   },
 };
