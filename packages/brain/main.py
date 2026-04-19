@@ -9,10 +9,12 @@ Startup sequence:
   3. TaskDispatcher instantiated with pool
   4. Memory pipeline: Embedder + ZillizStore + RaptorTree + MemoryWorker
   5. LifecycleEngine + GroundTruthStore + RDLoop (if Redis available)
+  5c. SpacePromoter (optional — health-check loop + CF KV promotion)
   6. Sentinel instantiated (if GEMINI_SENTINEL_KEY set)
   7. Council instantiated (always — uses general pool)
   8. Background tasks: health-ping + memory flush worker
   9. FastAPI app begins serving on port 7860 (HF Spaces standard)
+  10. Discord bot: blocking .run() in daemon thread (lifecycle-aware)
 
 Endpoints:
   POST /infer                   — Discord bot -> Brain. Auth: X-Ultron-Token header.
@@ -29,6 +31,8 @@ Design decisions:
   - /health is intentionally unauthenticated — CF Worker + Sentinel ping without token.
   - Structured JSON responses everywhere. Discord-formatted strings only at bot layer.
   - Request IDs injected via middleware for distributed tracing readiness.
+  - Discord bot runs in daemon thread (discord.py owns its own asyncio event loop).
+  - SpacePromoter runs as asyncio task inside FastAPI's event loop (pure async).
 
 Future bug risks (pre-registered):
   M1 [HIGH]   HF Spaces can spin up MULTIPLE workers for the same Space on scale events.
@@ -80,12 +84,22 @@ Future bug risks (pre-registered):
               triggered externally (post-task completion). If called from /infer handler,
               it blocks the response. Fix: always asyncio.create_task() for RDLoop.run().
 
-Tool calls used writing this file (v25):
-    Github:get_file_contents x1 (lifecycle.py interface)
-    Github:get_file_contents x1 (ground_truth.py interface)
-    Github:get_file_contents x1 (rd_loop.py interface)
+  M7 [MED]    Discord bot thread holds a reference to redis_client (aioredis). aioredis
+              client is created in FastAPI's asyncio event loop. Bot thread runs its own
+              event loop (discord.py). Cross-loop Redis calls from bot thread will raise
+              "bound to different event loop". Fix v26: bot thread calls Brain /infer HTTP
+              (already the architecture) — never calls Redis directly from bot thread.
+              No issue in current design; flag for future if bot ever goes direct-Redis.
+
+  M8 [LOW]    SpacePromoter _promoter_stop event created in lifespan scope; if lifespan
+              exits before promoter task starts (edge case on fast shutdown), stop event
+              is set before task reads it — task exits immediately. Acceptable: only on
+              startup crash scenarios.
+
+Tool calls used writing this file (v26):
     Github:get_file_contents x1 (main.py current state + sha)
-    pipecat-ai/pipecat: src/pipecat/services/groq/stt.py (Whisper API pattern)
+    Github:get_file_contents x1 (discord_bot.py — run() signature)
+    Github:get_file_contents x1 (space_promoter.py — SpacePromoter.run() signature)
 """
 
 from __future__ import annotations
@@ -95,6 +109,7 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -112,6 +127,8 @@ from packages.brain.task_dispatcher import TaskDispatcher
 from packages.brain.llm_router import make_provider_llm_fn
 from packages.shared.config import get_settings
 from packages.shared.exceptions import AllKeysExhaustedError, SentinelKeyUnavailableError
+from packages.brain import discord_bot as _discord_bot  # type: ignore
+from packages.infrastructure.space_promoter import SpacePromoter
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -287,6 +304,17 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("[Startup] Lifecycle/GT/RDLoop DISABLED — Redis not available")
 
+    # ── Step 5c: SpacePromoter (optional — health-check + CF KV promotion) ─
+    _promoter_stop: asyncio.Event = asyncio.Event()
+    _promoter_task: Optional[asyncio.Task] = None
+    try:
+        promoter = SpacePromoter(redis_client=redis_client)
+        _promoter_task = asyncio.create_task(promoter.run(_promoter_stop))
+        app.state.promoter = promoter
+        logger.info("[Startup] SpacePromoter: ACTIVE")
+    except Exception as e:
+        logger.warning(f"[Startup] SpacePromoter init failed (non-fatal): {e}")
+
     # ── Step 6: Sentinel (optional — degrades gracefully if key unset) ────
     sentinel = None
     try:
@@ -323,13 +351,37 @@ async def lifespan(app: FastAPI):
         _health_ping_loop(_brain_url, interval_seconds=43200)
     )
 
+    # ── Step 10: Discord bot (daemon thread — discord.py owns its own event loop) ──
+    # M7: bot only calls Brain /infer via HTTP, never touches Redis directly —
+    # no cross-loop aioredis issue. Passing redis_client as reference is safe
+    # because bot module receives it but only the on_message handler uses it
+    # for Redis calls that run inside its own thread's event loop via discord.py.
+    # NOTE: discord_bot._ctx_append/_ctx_get use asyncio internally. They run
+    # in the bot's own event loop (created by discord.py in the bot thread) —
+    # NOT in FastAPI's loop. The aioredis client created here is bound to
+    # FastAPI's loop. WORKAROUND: bot module must create its OWN aioredis client
+    # internally if Redis calls needed. For now, Redis is passed but aioredis
+    # may raise cross-loop errors — tracked as M7. Mitigation: pass redis=None
+    # until bot-side Redis is refactored to create its own client.
+    _bot_lifecycle = getattr(app.state, "lifecycle", None)
+    _bot_thread = threading.Thread(
+        target=_discord_bot.run,
+        kwargs={"redis": None, "lifecycle": _bot_lifecycle},  # M7: redis=None until bot refactor
+        daemon=True,
+        name="ultron-discord-bot",
+    )
+    _bot_thread.start()
+    logger.info("[Startup] Discord bot thread started.")
+
     elapsed = (time.monotonic() - startup_start) * 1000
     lifecycle_active = hasattr(app.state, "lifecycle") and app.state.lifecycle is not None
     logger.info(
         f"[Startup] Ultron V4 Brain READY in {elapsed:.1f}ms. "
         f"Pool general={len(pool.general)} sentinel={'ACTIVE' if sentinel else 'INACTIVE'} "
         f"council=ACTIVE memory={'ACTIVE' if memory_worker_task else 'INACTIVE'} "
-        f"lifecycle={'ACTIVE' if lifecycle_active else 'INACTIVE'}"
+        f"lifecycle={'ACTIVE' if lifecycle_active else 'INACTIVE'} "
+        f"promoter={'ACTIVE' if _promoter_task else 'INACTIVE'} "
+        f"discord_bot=ACTIVE"
     )
 
     # ── Yield: serve requests ─────────────────────────────────────────────
@@ -337,11 +389,18 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────────────────────
     logger.info("[Shutdown] Cancelling background tasks...")
+    _promoter_stop.set()  # signal SpacePromoter to exit cleanly
     _ping_task.cancel()
     if memory_worker_task:
         memory_worker_task.cancel()
         try:
             await memory_worker_task
+        except asyncio.CancelledError:
+            pass
+    if _promoter_task:
+        _promoter_task.cancel()
+        try:
+            await _promoter_task
         except asyncio.CancelledError:
             pass
     try:
@@ -352,6 +411,7 @@ async def lifespan(app: FastAPI):
         await redis_client.aclose()
     if hasattr(app.state, "zilliz_store"):
         await app.state.zilliz_store.close()
+    # Discord bot thread is daemon — dies with process. No explicit join needed.
     logger.info("[Shutdown] Ultron V4 Brain stopped cleanly.")
 
 
@@ -398,6 +458,13 @@ async def health(request: Request) -> JSONResponse:
     uptime = time.monotonic() - request.app.state.start_time
     status = "ok" if pool_status["general_available"] > 0 else "degraded"
 
+    promoter_status = None
+    if hasattr(request.app.state, "promoter"):
+        try:
+            promoter_status = request.app.state.promoter.get_status()
+        except Exception:
+            pass
+
     return JSONResponse({
         "status":             status,
         "uptime_seconds":     round(uptime, 1),
@@ -406,6 +473,8 @@ async def health(request: Request) -> JSONResponse:
         "sentinel_active":    request.app.state.sentinel is not None,
         "council_active":     hasattr(request.app.state, "council"),
         "lifecycle_active":   hasattr(request.app.state, "lifecycle") and request.app.state.lifecycle is not None,
+        "promoter_active":    hasattr(request.app.state, "promoter"),
+        "promoter":           promoter_status,
         "pool": {
             "general_available":  pool_status["general_available"],
             "general_total":      len(pool_status["general"]),
