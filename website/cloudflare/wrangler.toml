@@ -5,6 +5,13 @@ compatibility_date = "2024-01-01"
 [vars]
 BRAIN_URL = "https://ghostdrive1-ultron1.hf.space"
 
-# Secrets — set via CLI:
+# KV namespace binding for dynamic HF Space routing
+# Ghost: run `npx wrangler kv namespace list` to get your namespace ID
+# or reuse v3 KV ID: 77184c17886d47f2be73b6d441ada952
+[[kv_namespaces]]
+binding = "KV_ROUTING"
+id = "77184c17886d47f2be73b6d441ada952"
+
+# Secrets — set via CLI before deploy:
 #   npx wrangler secret put AUTH_TOKEN
-# (use the same token as Brain auth: de76095c6d76...)
+#   (value: de76095c6d7693000b5d6331847b3c6d5cc3b900ed3cdd96e6c2a7d598fe48d3)
