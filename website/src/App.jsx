@@ -6,6 +6,7 @@ import Memory from './pages/Memory';
 import Projects from './pages/Projects';
 import Sentinel from './pages/Sentinel';
 import Settings from './pages/Settings';
+import Chat from './pages/Chat';
 
 export default function App() {
   return (
@@ -15,6 +16,7 @@ export default function App() {
         <div className="max-w-4xl">
           <Routes>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/chat" element={<Chat />} />
             <Route path="/credentials" element={<Credentials />} />
             <Route path="/memory" element={<Memory />} />
             <Route path="/projects" element={<Projects />} />
