@@ -23,6 +23,7 @@ Endpoints:
   GET  /keys                    — Pool status + key counts per provider (website dashboard).
   GET  /memory/stm/{channel_id} — Redis STM context viewer for website Memory tab.
   GET  /rd/history/{user_id}    — R&D loop implemented improvements for website.
+  GET  /infra/events            — SpacePromoter Redis event log for website Sentinel tab.
 
 Design decisions:
   - asynccontextmanager lifespan (FastAPI 0.93+ pattern). No @app.on_event.
@@ -351,18 +352,7 @@ async def lifespan(app: FastAPI):
         _health_ping_loop(_brain_url, interval_seconds=43200)
     )
 
-    # ── Step 10: Discord bot (daemon thread — discord.py owns its own event loop) ──
-    # M7: bot only calls Brain /infer via HTTP, never touches Redis directly —
-    # no cross-loop aioredis issue. Passing redis_client as reference is safe
-    # because bot module receives it but only the on_message handler uses it
-    # for Redis calls that run inside its own thread's event loop via discord.py.
-    # NOTE: discord_bot._ctx_append/_ctx_get use asyncio internally. They run
-    # in the bot's own event loop (created by discord.py in the bot thread) —
-    # NOT in FastAPI's loop. The aioredis client created here is bound to
-    # FastAPI's loop. WORKAROUND: bot module must create its OWN aioredis client
-    # internally if Redis calls needed. For now, Redis is passed but aioredis
-    # may raise cross-loop errors — tracked as M7. Mitigation: pass redis=None
-    # until bot-side Redis is refactored to create its own client.
+    # ── Step 10: Discord bot (daemon thread) ──────────────────────────────
     _bot_lifecycle = getattr(app.state, "lifecycle", None)
     _bot_thread = threading.Thread(
         target=_discord_bot.run,
@@ -389,7 +379,7 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────────────────────
     logger.info("[Shutdown] Cancelling background tasks...")
-    _promoter_stop.set()  # signal SpacePromoter to exit cleanly
+    _promoter_stop.set()
     _ping_task.cancel()
     if memory_worker_task:
         memory_worker_task.cancel()
@@ -411,7 +401,6 @@ async def lifespan(app: FastAPI):
         await redis_client.aclose()
     if hasattr(app.state, "zilliz_store"):
         await app.state.zilliz_store.close()
-    # Discord bot thread is daemon — dies with process. No explicit join needed.
     logger.info("[Shutdown] Ultron V4 Brain stopped cleanly.")
 
 
@@ -495,7 +484,6 @@ async def infer(body: InferRequest, request: Request) -> InferResponse:
 
     dispatcher: TaskDispatcher = request.app.state.dispatcher
 
-    # Fire lifecycle.ingest() as background task (non-blocking) — CL6 mitigation
     lifecycle = getattr(request.app.state, "lifecycle", None)
     if lifecycle is not None:
         asyncio.create_task(
@@ -540,11 +528,6 @@ async def infer(body: InferRequest, request: Request) -> InferResponse:
 
 @app.post("/sentinel/event")
 async def sentinel_event(body: SentinelEvent, request: Request) -> JSONResponse:
-    """
-    Sentinel writes routing decisions and incident reports here.
-    Fully wired in v22: delegates to Sentinel.handle_event() if Sentinel active.
-    If Sentinel inactive (no GEMINI_SENTINEL_KEY), logs event and returns 200.
-    """
     settings = request.app.state.settings
     _check_auth(request, getattr(settings, "ultron_auth_token", ""))
 
@@ -558,8 +541,7 @@ async def sentinel_event(body: SentinelEvent, request: Request) -> JSONResponse:
 
     if sentinel is None:
         logger.warning(
-            f"[Sentinel] Event received but Sentinel INACTIVE "
-            f"(GEMINI_SENTINEL_KEY not set). event_type={body.event_type}"
+            f"[Sentinel] Event received but Sentinel INACTIVE. event_type={body.event_type}"
         )
         return JSONResponse({
             "status": "logged_only",
@@ -587,17 +569,12 @@ async def sentinel_event(body: SentinelEvent, request: Request) -> JSONResponse:
 
 @app.get("/keys")
 async def keys_status(request: Request) -> JSONResponse:
-    """
-    Returns per-provider key pool status for the website Credentials dashboard.
-    Auth required.
-    """
     settings = request.app.state.settings
     _check_auth(request, getattr(settings, "ultron_auth_token", ""))
 
     pool: KeyPool = request.app.state.pool
     pool_status = await pool.status()
 
-    # Build per-provider breakdown
     providers: dict[str, dict] = {}
     for key_info in pool_status.get("general", []):
         provider = key_info.get("provider", "unknown")
@@ -627,11 +604,6 @@ async def keys_status(request: Request) -> JSONResponse:
 
 @app.get("/memory/stm/{channel_id}")
 async def memory_stm(channel_id: str, request: Request) -> JSONResponse:
-    """
-    Returns the STM (short-term memory) context for a channel.
-    Used by website Memory tab — STM view.
-    Auth required.
-    """
     settings = request.app.state.settings
     _check_auth(request, getattr(settings, "ultron_auth_token", ""))
 
@@ -639,24 +611,18 @@ async def memory_stm(channel_id: str, request: Request) -> JSONResponse:
     if redis is None:
         return JSONResponse({"error": "Redis not available"}, status_code=503)
 
-    # Read raw Redis context window (set by discord_bot.py)
     ctx_key = f"ultron:ctx:{channel_id}"
     try:
         entries = await redis.lrange(ctx_key, 0, -1)
-        messages = [
-            e.decode() if isinstance(e, bytes) else e
-            for e in entries
-        ]
+        messages = [e.decode() if isinstance(e, bytes) else e for e in entries]
     except Exception as e:
         logger.warning(f"[/memory/stm] Redis read failed: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
-    # Also return lifecycle STM if available
     lifecycle = getattr(request.app.state, "lifecycle", None)
     lifecycle_cells: List[dict] = []
     if lifecycle is not None:
         try:
-            # Use channel_id as user_id proxy for STM lookup (cells stored per user_id)
             cells = await lifecycle.get_stm(channel_id)
             lifecycle_cells = [c.to_dict() for c in cells]
         except Exception as e:
@@ -673,11 +639,6 @@ async def memory_stm(channel_id: str, request: Request) -> JSONResponse:
 
 @app.get("/rd/history/{user_id}")
 async def rd_history(user_id: str, request: Request) -> JSONResponse:
-    """
-    Returns the R&D loop implemented improvements for a user.
-    Used by website Projects tab — R&D history view.
-    Auth required.
-    """
     settings = request.app.state.settings
     _check_auth(request, getattr(settings, "ultron_auth_token", ""))
 
@@ -699,6 +660,36 @@ async def rd_history(user_id: str, request: Request) -> JSONResponse:
         "improvement_count": len(improvements),
         "rd_state": state.to_dict() if state else None,
     })
+
+
+@app.get("/infra/events")
+async def infra_events(request: Request) -> JSONResponse:
+    """
+    Returns last 100 SpacePromoter infrastructure events from Redis.
+    Used by website Sentinel tab — Infrastructure Events card.
+    Auth required.
+    Key: ultron:infra:events (list, JSON entries, written by space_promoter.py)
+    """
+    settings = request.app.state.settings
+    _check_auth(request, getattr(settings, "ultron_auth_token", ""))
+
+    redis = getattr(request.app.state, "redis", None)
+    if redis is None:
+        return JSONResponse([], status_code=200)  # degrade gracefully — no Redis
+
+    try:
+        raw_entries = await redis.lrange("ultron:infra:events", 0, -1)
+        events = []
+        for entry in raw_entries:
+            try:
+                decoded = entry.decode() if isinstance(entry, bytes) else entry
+                events.append(json.loads(decoded))
+            except Exception:
+                events.append({"raw": str(entry)})
+        return JSONResponse(events)
+    except Exception as e:
+        logger.warning(f"[/infra/events] Redis read failed: {e}")
+        return JSONResponse([], status_code=200)
 
 
 # ---------------------------------------------------------------------------
