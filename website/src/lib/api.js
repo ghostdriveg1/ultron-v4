@@ -1,57 +1,53 @@
 // website/src/lib/api.js
-// All API calls proxied through CF API Worker → Brain
-// Worker URL: https://ultron-api.ghostdriveg1.workers.dev
+// All Brain calls go through the CF Worker (ultron-api) which proxies to Brain.
+// Worker adds X-Ultron-Token from its own secret — website never holds the token.
 
-const API_BASE = import.meta.env.VITE_API_URL || 'https://ultron-api.ghostdriveg1.workers.dev';
-const AUTH_TOKEN = import.meta.env.VITE_AUTH_TOKEN || '';
+const BASE = import.meta.env.VITE_API_URL || 'https://ultron-api.ghostdriveg1.workers.dev';
 
-async function request(path, options = {}) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Ultron-Token': AUTH_TOKEN,
-      Authorization: `Bearer ${AUTH_TOKEN}`,
-      ...options.headers,
-    },
+async function req(path, opts = {}) {
+  const res = await fetch(`${BASE}${path}`, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...opts.headers },
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }
 
 export const api = {
-  // ── Brain health (includes pool + lifecycle + promoter status) ────────
-  health: () => request('/health'),
+  // GET /api/health → Brain /health
+  health: () => req('/api/health'),
 
-  // ── Infer (direct to brain) ───────────────────────────────────────────
-  infer: (payload) =>
-    request('/infer', { method: 'POST', body: JSON.stringify(payload) }),
+  // POST /api/infer → Brain /infer
+  infer: (payload) => req('/api/infer', { method: 'POST', body: JSON.stringify(payload) }),
 
-  // ── Key pool ──────────────────────────────────────────────────────────
+  // GET /api/keys → Brain /keys
   keys: {
-    status: () => request('/keys'),
+    list: () => req('/api/keys'),
   },
 
-  // ── Sentinel ──────────────────────────────────────────────────────────
+  // Sentinel
   sentinel: {
-    trigger: (eventType, payload = {}) =>
-      request('/sentinel/event', {
+    trigger: (type) =>
+      req('/api/sentinel/event', {
         method: 'POST',
-        body: JSON.stringify({
-          event_type: eventType,
-          payload: { source: 'website', ...payload },
-        }),
+        body: JSON.stringify({ event_type: type, payload: { source: 'website' } }),
       }),
+    reports: () => req('/api/sentinel/reports'),
   },
 
-  // ── Memory ────────────────────────────────────────────────────────────
+  // Memory
   memory: {
-    stm: (channelId) => request(`/memory/stm/${channelId}`),
+    stm: (channelId) => req(`/api/memory/stm/${channelId}`),
   },
 
-  // ── R&D loop history ─────────────────────────────────────────────────
+  // R&D loop history
   rd: {
-    history: (userId, limit = 30) =>
-      request(`/rd/history/${userId}?limit=${limit}`),
+    history: (userId, limit = 20) => req(`/api/rd/history/${userId}?limit=${limit}`),
+  },
+
+  // Infrastructure — SpacePromoter topology + infra event log
+  infra: {
+    promoterStatus: () => req('/api/health').then((d) => d.promoter ?? null),
+    events: () => req('/api/infra/events'),
   },
 };

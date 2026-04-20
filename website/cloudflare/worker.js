@@ -1,124 +1,78 @@
 /**
- * Ultron API Worker (ultron-api)
- * Separate from the routing worker (ultron-brain CF Worker).
- * Proxies /api/* requests from the website to the HF Space Brain.
+ * website/cloudflare/worker.js — ultron-api
+ * Proxies /api/* → Brain (active Space URL from KV).
+ * Injects X-Ultron-Token from Worker secret.
  *
- * Deploy: cd website/cloudflare && npx wrangler deploy
- * Secrets: npx wrangler secret put AUTH_TOKEN
+ * Env (set in CF dashboard):
+ *   ULTRON_AUTH_TOKEN  — forwarded as X-Ultron-Token
+ *   KV_ROUTING         — binding to KV namespace (ultron:routing:v4)
  */
 
-const DEFAULT_BRAIN_URL = 'https://ghostdrive1-ultron1.hf.space';
+const FALLBACK_BRAIN = 'https://ghostdrive1-ultron1.hf.space';
+const KV_ROUTING_KEY = 'ultron:routing:v4';
 
-const ALLOWED_ORIGINS = [
-  'http://localhost:5173',
-  'http://localhost:4173',
-  'https://ultron.pages.dev',
-  'https://ultron-control.pages.dev',
-];
-
-function corsHeaders(origin) {
-  const allowed = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-  return {
-    'Access-Control-Allow-Origin': allowed,
-    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Max-Age': '86400',
-  };
+async function getBrainUrl(env) {
+  try {
+    if (env.KV_ROUTING) {
+      const raw = await env.KV_ROUTING.get(KV_ROUTING_KEY);
+      if (raw) { const r = JSON.parse(raw); if (r?.primary) return r.primary.replace(/\/$/, ''); }
+    }
+  } catch {}
+  return FALLBACK_BRAIN;
 }
 
-function addCors(response, origin) {
-  const headers = new Headers(response.headers);
-  for (const [k, v] of Object.entries(corsHeaders(origin))) headers.set(k, v);
-  return new Response(response.body, { status: response.status, headers });
-}
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
 
-async function checkAuth(request, env) {
-  const auth = request.headers.get('Authorization') ?? '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
-  return token === (env.AUTH_TOKEN ?? '');
-}
-
-async function proxyToBrain(path, request, env) {
-  const brainUrl = env.BRAIN_URL ?? DEFAULT_BRAIN_URL;
-  const body = ['POST', 'PUT', 'PATCH'].includes(request.method) ? await request.text() : undefined;
-
-  const res = await fetch(`${brainUrl}${path}`, {
+async function proxy(request, brainPath, brainUrl, env) {
+  const init = {
     method: request.method,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${env.AUTH_TOKEN ?? ''}`,
-    },
-    body,
-  });
-
-  return new Response(await res.text(), {
-    status: res.status,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
-
-function stub(data) {
-  return new Response(JSON.stringify(data), {
-    status: 200,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Ultron-Token': env.ULTRON_AUTH_TOKEN ?? '' },
+  };
+  if (request.method === 'POST') init.body = await request.text();
+  const upstream = await fetch(`${brainUrl}${brainPath}`, init);
+  return new Response(await upstream.text(), {
+    status: upstream.status,
+    headers: { 'Content-Type': 'application/json', ...CORS },
   });
 }
 
 export default {
   async fetch(request, env) {
-    const origin = request.headers.get('Origin') ?? '';
-    const { pathname } = new URL(request.url);
+    const { pathname: path, search } = new URL(request.url);
 
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: corsHeaders(origin) });
-    }
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
 
-    const authed = await checkAuth(request, env);
-    if (!authed) {
-      return addCors(new Response('Unauthorized', { status: 401 }), origin);
-    }
+    const brain = await getBrainUrl(env);
 
-    let response;
+    if (path === '/api/health')         return proxy(request, '/health', brain, env);
+    if (path === '/api/infer')          return proxy(request, '/infer', brain, env);
+    if (path === '/api/keys')           return proxy(request, '/keys', brain, env);
+    if (path === '/api/sentinel/event') return proxy(request, '/sentinel/event', brain, env);
 
-    try {
-      if (pathname === '/api/health') {
-        response = await proxyToBrain('/health', request, env);
+    const stm = path.match(/^\/api\/memory\/stm\/(.+)$/);
+    if (stm) return proxy(request, `/memory/stm/${stm[1]}`, brain, env);
 
-      } else if (pathname === '/api/infer') {
-        response = await proxyToBrain('/infer', request, env);
+    const rd = path.match(/^\/api\/rd\/history\/(.+)$/);
+    if (rd) return proxy(request, `/rd/history/${rd[1]}${search}`, brain, env);
 
-      } else if (pathname === '/api/sentinel/event') {
-        response = await proxyToBrain('/sentinel/event', request, env);
-
-      } else if (pathname === '/api/keys') {
-        // TODO: implement key management endpoints in Brain (main.py)
-        response = stub({ keys: [], message: 'Key management endpoint pending — add to Brain main.py' });
-
-      } else if (pathname.startsWith('/api/memory/stm/')) {
-        // TODO: implement STM viewer endpoint in Brain
-        response = stub({ messages: [], message: 'STM viewer endpoint pending — add to Brain main.py' });
-
-      } else if (pathname === '/api/sentinel/reports') {
-        // TODO: fetch from Notion/Supabase
-        response = stub({ reports: [], message: 'Sentinel reports endpoint pending' });
-
-      } else if (pathname === '/api/projects') {
-        // TODO: fetch from Supabase
-        response = stub({ projects: [], message: 'Projects endpoint pending' });
-
-      } else {
-        response = new Response(JSON.stringify({ error: 'Not found' }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-        });
+    // /api/infra/events — proxy to Brain; 404 → empty array (endpoint added in future phase)
+    if (path === '/api/infra/events') {
+      try {
+        const r = await proxy(request, '/infra/events', brain, env);
+        if (r.status === 404) return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json', ...CORS } });
+        return r;
+      } catch {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json', ...CORS } });
       }
-    } catch (err) {
-      response = new Response(JSON.stringify({ error: err.message }), {
-        status: 502,
-        headers: { 'Content-Type': 'application/json' },
-      });
     }
 
-    return addCors(response, origin);
+    // /api/sentinel/reports — stub until Sentinel writes reports to retrievable store
+    if (path === '/api/sentinel/reports') return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json', ...CORS } });
+
+    return new Response(JSON.stringify({ error: 'Not found' }), { status: 404, headers: { 'Content-Type': 'application/json', ...CORS } });
   },
 };
