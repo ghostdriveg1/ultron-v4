@@ -70,18 +70,31 @@ logger = logging.getLogger(__name__)
 TAVILY_BASE_URL = "https://api.tavily.com"
 DDG_BASE_URL = "https://html.duckduckgo.com/html/"
 
-# Tavily key rotation — parse TAVILY_API_KEY_0 ... TAVILY_API_KEY_19
+# Tavily key rotation — accepts three env var patterns (priority order):
+#   1. TAVILY_KEY_0..19   ← project convention (matches GROQ_KEY_0, CEREBRAS_KEY_0)
+#   2. TAVILY_API_KEY_0..19
+#   3. TAVILY_API_KEY      (plain, legacy)
 def _parse_tavily_keys() -> list[str]:
+    seen: set[str] = set()
     keys: list[str] = []
-    # First check plain TAVILY_API_KEY
-    plain = os.environ.get("TAVILY_API_KEY", "").strip()
-    if plain:
-        keys.append(plain)
-    # Then indexed keys
-    for i in range(20):
-        k = os.environ.get(f"TAVILY_API_KEY_{i}", "").strip()
-        if k:
+
+    def _add(k: str) -> None:
+        k = k.strip()
+        if k and k not in seen:
+            seen.add(k)
             keys.append(k)
+
+    # Pattern 1 — project convention TAVILY_KEY_0..19
+    for i in range(20):
+        _add(os.environ.get(f"TAVILY_KEY_{i}", ""))
+
+    # Pattern 2 — legacy indexed TAVILY_API_KEY_0..19
+    for i in range(20):
+        _add(os.environ.get(f"TAVILY_API_KEY_{i}", ""))
+
+    # Pattern 3 — plain legacy key
+    _add(os.environ.get("TAVILY_API_KEY", ""))
+
     return keys
 
 
