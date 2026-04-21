@@ -14,7 +14,7 @@ Startup sequence:
   7. Council instantiated (always — uses general pool)
   8. Background tasks: health-ping + memory flush worker
   9. FastAPI app begins serving on port 7860 (HF Spaces standard)
-  10. Discord bot: blocking .run() in daemon thread (lifecycle-aware)
+  10. Discord bot: daemon thread ONLY if DISCORD_TOKEN set
 
 Endpoints:
   POST /infer                   — Discord bot -> Brain. Auth: X-Ultron-Token header.
@@ -32,7 +32,7 @@ Design decisions:
   - /health is intentionally unauthenticated — CF Worker + Sentinel ping without token.
   - Structured JSON responses everywhere. Discord-formatted strings only at bot layer.
   - Request IDs injected via middleware for distributed tracing readiness.
-  - Discord bot runs in daemon thread (discord.py owns its own asyncio event loop).
+  - Discord bot runs in daemon thread only when DISCORD_TOKEN is set.
   - SpacePromoter runs as asyncio task inside FastAPI's event loop (pure async).
 
 Future bug risks (pre-registered):
@@ -97,10 +97,8 @@ Future bug risks (pre-registered):
               is set before task reads it — task exits immediately. Acceptable: only on
               startup crash scenarios.
 
-Tool calls used writing this file (v26):
-    Github:get_file_contents x1 (main.py current state + sha)
-    Github:get_file_contents x1 (discord_bot.py — run() signature)
-    Github:get_file_contents x1 (space_promoter.py — SpacePromoter.run() signature)
+Tool calls used writing this file (v28):
+    Github:get_file_contents x2 (config.py, main.py)
 """
 
 from __future__ import annotations
@@ -128,7 +126,6 @@ from packages.brain.task_dispatcher import TaskDispatcher
 from packages.brain.llm_router import make_provider_llm_fn
 from packages.shared.config import get_settings
 from packages.shared.exceptions import AllKeysExhaustedError, SentinelKeyUnavailableError
-from packages.brain import discord_bot as _discord_bot  # type: ignore
 from packages.infrastructure.space_promoter import SpacePromoter
 
 logger = logging.getLogger(__name__)
@@ -352,16 +349,24 @@ async def lifespan(app: FastAPI):
         _health_ping_loop(_brain_url, interval_seconds=43200)
     )
 
-    # ── Step 10: Discord bot (daemon thread) ──────────────────────────────
-    _bot_lifecycle = getattr(app.state, "lifecycle", None)
-    _bot_thread = threading.Thread(
-        target=_discord_bot.run,
-        kwargs={"redis": None, "lifecycle": _bot_lifecycle},  # M7: redis=None until bot refactor
-        daemon=True,
-        name="ultron-discord-bot",
-    )
-    _bot_thread.start()
-    logger.info("[Startup] Discord bot thread started.")
+    # ── Step 10: Discord bot — only if DISCORD_TOKEN is set ───────────────
+    _bot_thread = None
+    if getattr(settings, "discord_token", None):
+        try:
+            import packages.brain.discord_bot as _discord_bot  # type: ignore
+            _bot_lifecycle = getattr(app.state, "lifecycle", None)
+            _bot_thread = threading.Thread(
+                target=_discord_bot.run,
+                kwargs={"redis": None, "lifecycle": _bot_lifecycle},
+                daemon=True,
+                name="ultron-discord-bot",
+            )
+            _bot_thread.start()
+            logger.info("[Startup] Discord bot thread started.")
+        except Exception as e:
+            logger.warning(f"[Startup] Discord bot failed to start (non-fatal): {e}")
+    else:
+        logger.warning("[Startup] Discord bot SKIPPED — DISCORD_TOKEN not set. Website-only mode.")
 
     elapsed = (time.monotonic() - startup_start) * 1000
     lifecycle_active = hasattr(app.state, "lifecycle") and app.state.lifecycle is not None
@@ -371,7 +376,7 @@ async def lifespan(app: FastAPI):
         f"council=ACTIVE memory={'ACTIVE' if memory_worker_task else 'INACTIVE'} "
         f"lifecycle={'ACTIVE' if lifecycle_active else 'INACTIVE'} "
         f"promoter={'ACTIVE' if _promoter_task else 'INACTIVE'} "
-        f"discord_bot=ACTIVE"
+        f"discord_bot={'ACTIVE' if _bot_thread else 'SKIPPED'}"
     )
 
     # ── Yield: serve requests ─────────────────────────────────────────────
@@ -664,18 +669,12 @@ async def rd_history(user_id: str, request: Request) -> JSONResponse:
 
 @app.get("/infra/events")
 async def infra_events(request: Request) -> JSONResponse:
-    """
-    Returns last 100 SpacePromoter infrastructure events from Redis.
-    Used by website Sentinel tab — Infrastructure Events card.
-    Auth required.
-    Key: ultron:infra:events (list, JSON entries, written by space_promoter.py)
-    """
     settings = request.app.state.settings
     _check_auth(request, getattr(settings, "ultron_auth_token", ""))
 
     redis = getattr(request.app.state, "redis", None)
     if redis is None:
-        return JSONResponse([], status_code=200)  # degrade gracefully — no Redis
+        return JSONResponse([], status_code=200)
 
     try:
         raw_entries = await redis.lrange("ultron:infra:events", 0, -1)

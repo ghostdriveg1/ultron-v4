@@ -21,7 +21,7 @@ Environment variable naming convention:
     REDIS_URL
     ZILLIZ_URI, ZILLIZ_TOKEN
     SUPABASE_URL, SUPABASE_KEY
-    DISCORD_TOKEN
+    DISCORD_TOKEN                  (optional — bot inactive if unset)
     CF_KV_API_TOKEN, CF_ACCOUNT_ID, CF_KV_NAMESPACE_ID
     ULTRON_AUTH_TOKEN              (brain ↔ CF Worker shared secret)
     TAVILY_API_KEY                 (search tool — free tier)
@@ -29,7 +29,8 @@ Environment variable naming convention:
 
 Startup validation:
     get_settings() raises on first call if any REQUIRED var is missing.
-    Required = REDIS_URL + at least one LLM key in general pool + DISCORD_TOKEN.
+    Required = REDIS_URL + at least one LLM key in general pool.
+    DISCORD_TOKEN is optional — bot skipped if unset.
     All others are optional-with-warnings.
 
 Future bug risks (pre-registered):
@@ -145,8 +146,8 @@ class Settings:
     supabase_url:       str
     supabase_key:       str
 
-    # Discord
-    discord_token: str
+    # Discord — optional, bot skipped if unset
+    discord_token: Optional[str]
 
     # Cloudflare
     cf_kv_api_token:    str
@@ -207,11 +208,14 @@ class Settings:
         if not self.supabase_url:
             logger.warning("[Config] SUPABASE_URL not set — Supabase structured memory inactive.")
 
-        # ── Discord ────────────────────────────────────────────────────────
-        self.discord_token = _require(
-            "DISCORD_TOKEN",
-            "Required for the bot interface. "
-        )
+        # ── Discord — OPTIONAL, bot skipped if unset ───────────────────────
+        _discord_raw = _optional("DISCORD_TOKEN")
+        self.discord_token = _discord_raw if _discord_raw else None
+        if not self.discord_token:
+            logger.warning(
+                "[Config] DISCORD_TOKEN not set — Discord bot will be INACTIVE. "
+                "Website-only mode active."
+            )
 
         # ── Cloudflare ─────────────────────────────────────────────────────
         self.cf_kv_api_token    = _optional("CF_KV_API_TOKEN")
@@ -248,7 +252,7 @@ class Settings:
             f"openrouter={len(self.openrouter_keys)} gemini={len(self.gemini_keys)} "
             f"total={total_general}. Sentinel={'YES' if self.gemini_sentinel_key else 'NO'}. "
             f"Redis={'SET' if self.redis_url else 'MISSING'}. "
-            f"Discord={'SET' if self.discord_token else 'MISSING'}."
+            f"Discord={'SET' if self.discord_token else 'INACTIVE'}."
         )
 
 
