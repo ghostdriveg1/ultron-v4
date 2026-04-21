@@ -1,0 +1,40 @@
+name: Sentinel Weekly Audit
+
+on:
+  schedule:
+    - cron: "0 2 * * 0"   # Every Sunday 02:00 UTC
+  workflow_dispatch:        # Manual trigger
+
+jobs:
+  sentinel-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install minimal deps
+        run: pip install httpx
+
+      - name: Trigger Sentinel audit via Brain API
+        env:
+          BRAIN_URL: ${{ secrets.BRAIN_URL }}
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import httpx, os, sys
+          brain = os.environ["BRAIN_URL"].rstrip("/")
+          token = os.environ["AUTH_TOKEN"]
+          r = httpx.post(
+              f"{brain}/sentinel/audit",
+              headers={"Authorization": f"Bearer {token}"},
+              timeout=120,
+          )
+          print(f"Status: {r.status_code}")
+          print(r.text[:500])
+          if r.status_code not in (200, 202):
+              sys.exit(1)
+          EOF
