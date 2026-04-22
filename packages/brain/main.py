@@ -10,6 +10,7 @@ Startup sequence:
   4. Memory pipeline: Embedder + ZillizStore + RaptorTree + MemoryWorker
   5. LifecycleEngine + GroundTruthStore + RDLoop (if Redis available)
   5c. SpacePromoter (optional — health-check loop + CF KV promotion)
+  5d. PlannerAgent (always — wraps TaskDispatcher for multi-step goals) [v29]
   6. Sentinel instantiated (if GEMINI_SENTINEL_KEY set)
   7. Council instantiated (always — uses general pool)
   8. Background tasks: health-ping + memory flush worker
@@ -18,6 +19,7 @@ Startup sequence:
 
 Endpoints:
   POST /infer                   — Discord bot -> Brain. Auth: X-Ultron-Token header.
+  POST /plan                    — Multi-step goal decompose+execute via PlannerAgent. [v29]
   GET  /health                  — CF Worker keep-alive + Sentinel audit. No auth.
   POST /sentinel/event          — Sentinel writes incident/routing decision. Auth required.
   GET  /keys                    — Pool status + key counts per provider (website dashboard).
@@ -34,6 +36,7 @@ Design decisions:
   - Request IDs injected via middleware for distributed tracing readiness.
   - Discord bot runs in daemon thread only when DISCORD_TOKEN is set.
   - SpacePromoter runs as asyncio task inside FastAPI's event loop (pure async).
+  - PlannerAgent wraps TaskDispatcher; complex goals go through /plan, simple to /infer.
 
 Future bug risks (pre-registered):
   M1 [HIGH]   HF Spaces can spin up MULTIPLE workers for the same Space on scale events.
@@ -60,6 +63,11 @@ Future bug risks (pre-registered):
   M6 [LOW]    Lifespan background task (health_ping) has no cancellation guard.
               If the task raises an exception, it dies silently — no restart.
               Fix: wrap task body in try/except + re-schedule on error.
+
+  M9 [MED]    /plan endpoint shares same pool as /infer. Multi-step plans with 6
+              subtasks × 5 ReAct iters = 30 LLM calls per request. With M2's
+              concurrency issue, this amplifies 429 risk 6x vs /infer.
+              Fix: asyncio.Semaphore(max_concurrent=1) on /plan specifically.
 
   CL1 [HIGH]  Memory worker (MemoryWorker) is optional — if ZILLIZ_URI or ZILLIZ_TOKEN
               missing, worker is skipped. Verify settings check doesn't raise on missing
@@ -97,8 +105,10 @@ Future bug risks (pre-registered):
               is set before task reads it — task exits immediately. Acceptable: only on
               startup crash scenarios.
 
-Tool calls used writing this file (v28):
-    Github:get_file_contents x2 (config.py, main.py)
+Tool calls used writing this file (v29):
+    Github:get_file_contents x5 (main.py, task_dispatcher, code_exec, browser_agent, react_loop)
+    Github:push_files x2
+    Notion:notion-fetch x1
 """
 
 from __future__ import annotations
@@ -124,6 +134,7 @@ from packages.brain.key_rotation.config_loader import build_pool_config
 from packages.brain.key_rotation.pool import KeyPool
 from packages.brain.task_dispatcher import TaskDispatcher
 from packages.brain.llm_router import make_provider_llm_fn
+from packages.brain.planner import PlannerAgent, get_planner
 from packages.shared.config import get_settings
 from packages.shared.exceptions import AllKeysExhaustedError, SentinelKeyUnavailableError
 from packages.infrastructure.space_promoter import SpacePromoter
@@ -133,6 +144,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+# Semaphore for /plan endpoint — M9 mitigation
+_plan_semaphore = asyncio.Semaphore(1)
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +168,25 @@ class InferResponse(BaseModel):
     latency_ms: float
 
 
+class PlanRequest(BaseModel):
+    goal: str
+    channel_id: str
+    user_id: str
+    username: Optional[str] = None
+    context: Optional[str] = ""
+
+
+class PlanResponse(BaseModel):
+    reply: str
+    channel_id: str
+    user_id: str
+    request_id: str
+    latency_ms: float
+    subtask_count: int
+
+
 class SentinelEvent(BaseModel):
-    event_type: str            # "space_failure" | "routing_override" | "health_check" | "weekly_audit" | "project_plan"
+    event_type: str
     payload: dict[str, Any]
     timestamp: Optional[float] = None
 
@@ -165,22 +196,19 @@ class SentinelEvent(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _check_auth(request: Request, settings_token: str) -> None:
-    """Validate X-Ultron-Token header. Raises 401 if invalid or missing."""
     if not settings_token:
         logger.warning("[Auth] ULTRON_AUTH_TOKEN not set — skipping auth (DEV MODE).")
         return
-
     token = request.headers.get("X-Ultron-Token", "")
     if not hmac.compare_digest(token, settings_token):
         raise HTTPException(status_code=401, detail="Invalid or missing X-Ultron-Token.")
 
 
 # ---------------------------------------------------------------------------
-# Background task: health ping (keep HF Space warm)
+# Background task: health ping
 # ---------------------------------------------------------------------------
 
 async def _health_ping_loop(brain_url: str, interval_seconds: int = 43200) -> None:
-    """Ping /health every N seconds to keep HF Space warm."""
     await asyncio.sleep(60)
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
@@ -193,37 +221,35 @@ async def _health_ping_loop(brain_url: str, interval_seconds: int = 43200) -> No
 
 
 # ---------------------------------------------------------------------------
-# Lifespan: startup + shutdown
+# Lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """FastAPI lifespan context."""
     logger.info("[Startup] Ultron V4 Brain starting...")
     startup_start = time.monotonic()
 
-    # ── Step 1: Settings ──────────────────────────────────────────────────
+    # Step 1: Settings
     try:
         settings = get_settings()
     except RuntimeError as e:
         logger.critical(f"[Startup] Settings validation FAILED: {e}")
         raise
 
-    # ── Step 2–3: KeyPool ─────────────────────────────────────────────────
+    # Step 2-3: KeyPool
     pool_config = build_pool_config(settings)
     pool = KeyPool(pool_config)
 
-    # ── Step 4: TaskDispatcher ────────────────────────────────────────────
+    # Step 4: TaskDispatcher
     dispatcher = TaskDispatcher(pool=pool, settings=settings)
 
-    # ── Resolve brain_url early (needed by RDLoop + health ping) ──────────
     _brain_url = (
         "https://ghostdrive1-ultron1.hf.space"
         if not os.environ.get("LOCAL_DEV")
         else f"http://localhost:{getattr(settings, 'brain_port', 7860)}"
     )
 
-    # ── Step 5: Memory pipeline (optional — degrades gracefully if Zilliz unset) ──
+    # Step 5: Memory pipeline
     memory_worker_task: Optional[asyncio.Task] = None
     redis_client = None
 
@@ -233,7 +259,7 @@ async def lifespan(app: FastAPI):
 
     if zilliz_uri and zilliz_token and redis_url:
         try:
-            import redis.asyncio as aioredis  # type: ignore
+            import redis.asyncio as aioredis
             from packages.memory.embedder import Embedder
             from packages.memory.tier2_zilliz import ZillizStore
             from packages.memory.raptor import RaptorTree
@@ -247,29 +273,25 @@ async def lifespan(app: FastAPI):
             mem_worker   = MemoryWorker(redis=redis_client, embedder=embedder, raptor_tree=raptor_tree)
 
             memory_worker_task = asyncio.create_task(mem_worker.run())
-
             app.state.embedder     = embedder
             app.state.zilliz_store = zilliz_store
             app.state.raptor_tree  = raptor_tree
             app.state.redis        = redis_client
-
-            logger.info("[Startup] Memory pipeline: Embedder + ZillizStore + RaptorTree + MemoryWorker ACTIVE")
+            logger.info("[Startup] Memory pipeline: ACTIVE")
         except Exception as e:
             logger.warning(f"[Startup] Memory pipeline init failed (non-fatal): {e}")
     else:
         logger.warning("[Startup] Memory pipeline DISABLED — ZILLIZ_URI/ZILLIZ_TOKEN/REDIS_URL not set")
-
-        # Still init Redis alone for context windows + council state (if URL available)
         if redis_url:
             try:
-                import redis.asyncio as aioredis  # type: ignore
+                import redis.asyncio as aioredis
                 redis_client = aioredis.from_url(redis_url, decode_responses=False)
                 app.state.redis = redis_client
                 logger.info("[Startup] Redis-only client active (no Zilliz)")
             except Exception as e:
                 logger.warning(f"[Startup] Redis init failed (non-fatal): {e}")
 
-    # ── Step 5b: Lifecycle + GroundTruth + RDLoop (optional — needs Redis) ──
+    # Step 5b: Lifecycle + GroundTruth + RDLoop
     lifecycle = None
     gt_store  = None
     rd_loop   = None
@@ -281,7 +303,6 @@ async def lifespan(app: FastAPI):
             from packages.brain.rd_loop import RDLoop
 
             discord_webhook = os.environ.get("DISCORD_WEBHOOK_URL", "") or None
-
             lifecycle = LifecycleEngine(redis_client)
             gt_store  = GroundTruthStore(redis_client)
             rd_loop   = RDLoop(
@@ -291,18 +312,16 @@ async def lifespan(app: FastAPI):
                 auth_token=getattr(settings, "ultron_auth_token", ""),
                 discord_webhook=discord_webhook,
             )
-
             app.state.lifecycle = lifecycle
             app.state.gt_store  = gt_store
             app.state.rd_loop   = rd_loop
-
             logger.info("[Startup] LifecycleEngine + GroundTruthStore + RDLoop: ACTIVE")
         except Exception as e:
             logger.warning(f"[Startup] Lifecycle/GT/RDLoop init failed (non-fatal): {e}")
     else:
         logger.warning("[Startup] Lifecycle/GT/RDLoop DISABLED — Redis not available")
 
-    # ── Step 5c: SpacePromoter (optional — health-check + CF KV promotion) ─
+    # Step 5c: SpacePromoter
     _promoter_stop: asyncio.Event = asyncio.Event()
     _promoter_task: Optional[asyncio.Task] = None
     try:
@@ -313,7 +332,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[Startup] SpacePromoter init failed (non-fatal): {e}")
 
-    # ── Step 6: Sentinel (optional — degrades gracefully if key unset) ────
+    # Step 5d: PlannerAgent [v29]
+    try:
+        planner = get_planner(pool=pool, redis=redis_client)
+        app.state.planner = planner
+        logger.info("[Startup] PlannerAgent: ACTIVE")
+    except Exception as e:
+        logger.warning(f"[Startup] PlannerAgent init failed (non-fatal): {e}")
+
+    # Step 6: Sentinel
     sentinel = None
     try:
         from packages.brain.sentinel import build_sentinel
@@ -325,7 +352,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[Startup] Sentinel init failed (non-fatal): {e}")
 
-    # ── Step 7: Council (always active — uses general pool) ───────────────
+    # Step 7: Council
     try:
         from packages.brain.council import Council
         council = Council(
@@ -337,23 +364,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[Startup] Council init failed (non-fatal): {e}")
 
-    # ── Step 8: Store core state ──────────────────────────────────────────
+    # Step 8: Store core state
     app.state.settings   = settings
     app.state.pool       = pool
     app.state.dispatcher = dispatcher
     app.state.sentinel   = sentinel
     app.state.start_time = startup_start
 
-    # ── Step 9: Background health ping ────────────────────────────────────
+    # Step 9: Background health ping
     _ping_task = asyncio.create_task(
         _health_ping_loop(_brain_url, interval_seconds=43200)
     )
 
-    # ── Step 10: Discord bot — only if DISCORD_TOKEN is set ───────────────
+    # Step 10: Discord bot
     _bot_thread = None
     if getattr(settings, "discord_token", None):
         try:
-            import packages.brain.discord_bot as _discord_bot  # type: ignore
+            import packages.brain.discord_bot as _discord_bot
             _bot_lifecycle = getattr(app.state, "lifecycle", None)
             _bot_thread = threading.Thread(
                 target=_discord_bot.run,
@@ -370,19 +397,22 @@ async def lifespan(app: FastAPI):
 
     elapsed = (time.monotonic() - startup_start) * 1000
     lifecycle_active = hasattr(app.state, "lifecycle") and app.state.lifecycle is not None
+    planner_active   = hasattr(app.state, "planner")
     logger.info(
         f"[Startup] Ultron V4 Brain READY in {elapsed:.1f}ms. "
-        f"Pool general={len(pool.general)} sentinel={'ACTIVE' if sentinel else 'INACTIVE'} "
-        f"council=ACTIVE memory={'ACTIVE' if memory_worker_task else 'INACTIVE'} "
+        f"Pool general={len(pool.general)} "
+        f"sentinel={'ACTIVE' if sentinel else 'INACTIVE'} "
+        f"council=ACTIVE "
+        f"memory={'ACTIVE' if memory_worker_task else 'INACTIVE'} "
         f"lifecycle={'ACTIVE' if lifecycle_active else 'INACTIVE'} "
         f"promoter={'ACTIVE' if _promoter_task else 'INACTIVE'} "
+        f"planner={'ACTIVE' if planner_active else 'INACTIVE'} "
         f"discord_bot={'ACTIVE' if _bot_thread else 'SKIPPED'}"
     )
 
-    # ── Yield: serve requests ─────────────────────────────────────────────
     yield
 
-    # ── Shutdown ──────────────────────────────────────────────────────────
+    # Shutdown
     logger.info("[Shutdown] Cancelling background tasks...")
     _promoter_stop.set()
     _ping_task.cancel()
@@ -428,10 +458,6 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Request ID middleware
-# ---------------------------------------------------------------------------
-
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     req_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:8])
@@ -460,15 +486,16 @@ async def health(request: Request) -> JSONResponse:
             pass
 
     return JSONResponse({
-        "status":             status,
-        "uptime_seconds":     round(uptime, 1),
-        "version":            "4.0.0",
-        "memory_pipeline":    hasattr(request.app.state, "raptor_tree"),
-        "sentinel_active":    request.app.state.sentinel is not None,
-        "council_active":     hasattr(request.app.state, "council"),
-        "lifecycle_active":   hasattr(request.app.state, "lifecycle") and request.app.state.lifecycle is not None,
-        "promoter_active":    hasattr(request.app.state, "promoter"),
-        "promoter":           promoter_status,
+        "status":           status,
+        "uptime_seconds":   round(uptime, 1),
+        "version":          "4.0.0",
+        "memory_pipeline":  hasattr(request.app.state, "raptor_tree"),
+        "sentinel_active":  request.app.state.sentinel is not None,
+        "council_active":   hasattr(request.app.state, "council"),
+        "lifecycle_active": hasattr(request.app.state, "lifecycle") and request.app.state.lifecycle is not None,
+        "promoter_active":  hasattr(request.app.state, "promoter"),
+        "planner_active":   hasattr(request.app.state, "planner"),
+        "promoter":         promoter_status,
         "pool": {
             "general_available":  pool_status["general_available"],
             "general_total":      len(pool_status["general"]),
@@ -480,7 +507,6 @@ async def health(request: Request) -> JSONResponse:
 
 @app.post("/infer", response_model=InferResponse)
 async def infer(body: InferRequest, request: Request) -> InferResponse:
-    """Main Discord -> Brain endpoint."""
     req_id  = getattr(request.state, "request_id", "?")
     t_start = time.monotonic()
 
@@ -531,6 +557,75 @@ async def infer(body: InferRequest, request: Request) -> InferResponse:
     )
 
 
+@app.post("/plan", response_model=PlanResponse)
+async def plan(body: PlanRequest, request: Request) -> PlanResponse:
+    """Multi-step goal planning endpoint. Uses PlannerAgent (HTN decompose+execute).
+
+    Use this instead of /infer for complex goals requiring multiple steps.
+    Rate-limited to 1 concurrent plan (M9 mitigation: 6 subtasks × 5 iters = 30 LLM calls).
+    """
+    req_id  = getattr(request.state, "request_id", "?")
+    t_start = time.monotonic()
+
+    settings = request.app.state.settings
+    _check_auth(request, getattr(settings, "ultron_auth_token", ""))
+
+    planner: Optional[PlannerAgent] = getattr(request.app.state, "planner", None)
+    if planner is None:
+        raise HTTPException(status_code=503, detail="PlannerAgent not initialized.")
+
+    # Lifecycle ingest
+    lifecycle = getattr(request.app.state, "lifecycle", None)
+    if lifecycle is not None:
+        asyncio.create_task(
+            lifecycle.ingest(
+                user_id=body.user_id,
+                channel_id=body.channel_id,
+                raw_text=body.goal,
+                metadata={"source": "plan", "username": body.username or "user"},
+            )
+        )
+
+    try:
+        async with _plan_semaphore:  # M9: serialise /plan requests
+            reply = await planner.run(
+                goal=body.goal,
+                channel_id=body.channel_id,
+                user_id=body.user_id,
+                initial_context=body.context or "",
+            )
+    except AllKeysExhaustedError as e:
+        logger.error(f"[/plan] req_id={req_id} AllKeysExhaustedError: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="All LLM keys exhausted. Try again later."
+        )
+    except Exception as e:
+        logger.exception(f"[/plan] req_id={req_id} PlannerAgent raised: {e}")
+        raise HTTPException(status_code=500, detail="Planner error.")
+
+    latency_ms = (time.monotonic() - t_start) * 1000
+
+    # Count subtasks from reply structure (heuristic: count bold [N] headers)
+    subtask_count = reply.count("**[")
+    if subtask_count == 0:
+        subtask_count = 1  # simple pass-through
+
+    logger.info(
+        f"[/plan] req_id={req_id} channel={body.channel_id} "
+        f"subtasks={subtask_count} latency={latency_ms:.0f}ms"
+    )
+
+    return PlanResponse(
+        reply=reply,
+        channel_id=body.channel_id,
+        user_id=body.user_id,
+        request_id=req_id,
+        latency_ms=round(latency_ms, 1),
+        subtask_count=subtask_count,
+    )
+
+
 @app.post("/sentinel/event")
 async def sentinel_event(body: SentinelEvent, request: Request) -> JSONResponse:
     settings = request.app.state.settings
@@ -545,9 +640,6 @@ async def sentinel_event(body: SentinelEvent, request: Request) -> JSONResponse:
     )
 
     if sentinel is None:
-        logger.warning(
-            f"[Sentinel] Event received but Sentinel INACTIVE. event_type={body.event_type}"
-        )
         return JSONResponse({
             "status": "logged_only",
             "reason": "Sentinel inactive — set GEMINI_SENTINEL_KEY",
@@ -567,10 +659,6 @@ async def sentinel_event(body: SentinelEvent, request: Request) -> JSONResponse:
             status_code=500,
         )
 
-
-# ---------------------------------------------------------------------------
-# Website API endpoints
-# ---------------------------------------------------------------------------
 
 @app.get("/keys")
 async def keys_status(request: Request) -> JSONResponse:
@@ -634,10 +722,10 @@ async def memory_stm(channel_id: str, request: Request) -> JSONResponse:
             logger.warning(f"[/memory/stm] lifecycle.get_stm failed: {e}")
 
     return JSONResponse({
-        "channel_id": channel_id,
-        "context_window": messages,
+        "channel_id":           channel_id,
+        "context_window":       messages,
         "context_window_count": len(messages),
-        "lifecycle_cells": lifecycle_cells,
+        "lifecycle_cells":      lifecycle_cells,
         "lifecycle_cell_count": len(lifecycle_cells),
     })
 
@@ -660,10 +748,10 @@ async def rd_history(user_id: str, request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500)
 
     return JSONResponse({
-        "user_id": user_id,
-        "improvements": [i.to_dict() for i in improvements],
+        "user_id":          user_id,
+        "improvements":     [i.to_dict() for i in improvements],
         "improvement_count": len(improvements),
-        "rd_state": state.to_dict() if state else None,
+        "rd_state":         state.to_dict() if state else None,
     })
 
 
@@ -692,7 +780,7 @@ async def infra_events(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint (uvicorn)
+# Entrypoint
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
