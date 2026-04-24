@@ -1,0 +1,45 @@
+# Ultron V4 — Voice Space requirements
+# Deployed to: ghostdrive1/ultron-voice (HF Spaces Docker, port 7860)
+# Install: pip install -r packages/voice/requirements-voice.txt
+#
+# Pre-registered bugs addressed by these pins:
+#   VS1: Kokoro KPipeline blocking startup -> run in executor (server.py handles, not here)
+#   VS3: float32->int16 conversion -> handled in server._to_wav_bytes()
+#   VS5: synthesis blocks event loop -> executor in server.py
+#   VS6: sample_rate hardcoded -> read from pipeline.sample_rate at runtime
+#
+# Tool calls used writing this file (v28):
+#   Github:get_file_contents x4 (voice/server.py, voice/stt.py, voice/tts.py, voice/pipeline.py)
+
+# --- Web framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# --- HTTP client (Groq Whisper STT calls) ---
+httpx==0.27.2
+
+# --- Pydantic (FastAPI models) ---
+pydantic==2.10.3
+
+# --- STT: Groq Whisper (API-based, no local model) ---
+# No extra package needed — uses httpx to POST multipart to Groq REST API.
+# GROQ_STT_KEY env var required at runtime.
+
+# --- TTS: Kokoro 82M (local model) ---
+# Kokoro requires: torch, soundfile, numpy, phonemizer, transformers internals
+kokoro==0.9.4
+torch==2.5.1+cpu          # CPU-only — HF Spaces Docker (no GPU on free tier)
+torchaudio==2.5.1+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# --- Audio processing ---
+numpy==1.26.4              # float32 array ops; kokoro output conversion (VS3)
+soundfile==0.12.1          # WAV read/write fallback
+
+# --- Phonemizer (Kokoro dependency for English G2P) ---
+phonemizer==3.3.0
+espeak-ng                  # system dep: install via apt in Dockerfile
+                           # Dockerfile: RUN apt-get install -y espeak-ng
+
+# --- Multipart file handling (UploadFile in /stt endpoint) ---
+python-multipart==0.0.12
