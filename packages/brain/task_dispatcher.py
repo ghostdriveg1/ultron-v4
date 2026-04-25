@@ -3,58 +3,30 @@ packages/brain/task_dispatcher.py
 
 Ultron V4 — Task Orchestration Layer
 =====================================
-Replaces V3's single-shot LLM dispatch with a full ReAct-loop-backed orchestrator.
+v31 update: MetacognitionEngine wired into dispatch().
+  pre_action_assessment()  called BEFORE ReActLoop
+  post_action_reflection() called AFTER  ReActLoop
 
-Responsibilities:
-  1. Classify incoming task (search / code / browser / file / computer_use / general)
-  2. Hydrate ToolRegistry with ALL concrete tools (search, code_exec, shell_exec,
-     browser_fetch, file_ops, file_read, computer_use)
-  3. Pull channel AgentState from Redis (persist back after loop finishes)
-  4. Call multi-provider key_rotation pool for LLM access (ALL 5 providers)
-  5. Run ReActLoop (flash_mode=True for Groq)
-  6. Strip internal memory/graph blocks before returning to Discord
-  7. Write long_term_memory snippets to Tier2 (Redis buffer → Zilliz flush later)
-
-Informed by:
-  - react_loop.py (this repo)                  : ReActLoop, ToolRegistry, AgentState
-  - llm_router.py (this repo)                  : make_provider_llm_fn
-  - packages/tools/search.py                   : tavily_search (real + DDG fallback)
-  - packages/tools/code_exec_tool.py           : code_exec_tool, shell_exec_tool (REAL)
-  - packages/tools/file_ops.py                 : file_ops_tool (sandboxed OS file ops)
-  - packages/tools/computer_use.py             : computer_use_tool (OS GUI automation)
-  - packages/tools/browser_agent.py            : BrowserAgent (Playwright)
-  - browser-use/browser-use                    : dispatch pattern, no-vision Groq rule
-  - OpenHands/codeact_agent                    : pending_actions, function_calling
-
-Design rules:
+Design rules unchanged:
   - flash_mode=True default (Groq 8k ctx safe)
   - Per-channel AgentState in Redis (key: ultron:state:{channel_id})
-  - LLM calls via make_provider_llm_fn(pool) from llm_router — ALL 5 providers
-  - Response to Discord: NEVER leak === MEMORY GRAPH === or [COMPACTED HISTORY] blocks
-  - Memory snippets: append to Redis list ultron:mem_buffer:{user_id} (Zilliz flush)
-  - max_iterations=5 default (hard ceiling from react_loop ABSOLUTE_MAX=10)
-  - search tool: REAL Tavily + DDG fallback
-  - code_exec: REAL subprocess execution via code_exec_tool.py
-  - file_ops: sandboxed workspace file ops via file_ops.py
-  - computer_use: OS GUI automation via computer_use.py (Xvfb required on HF)
+  - LLM calls via make_provider_llm_fn(pool) — ALL 8 providers now
+  - Response to Discord: NEVER leak internal blocks
+  - max_iterations=5 default
 
-Future bug risks (pre-registered):
-  D1 [HIGH]   Redis unavailable → AgentState fresh each msg → loop detector clears (B1)
-  D2 [HIGH]   Pool None/exhausted → llm_call_fn 401 → max failures → no user message
-  D3 [MED]    Keyword classifier ambiguity → wrong first tool → wasted iteration
-  D4 [MED]    Redis state TTL not set → accumulates → OOM. Fix: TTL=3600 always.
-  D5 [LOW]    mem_buffer unbounded → LTRIM to 100 after every RPUSH
-  D6 [LOW]    strip_internal_blocks() regex → add start-of-line anchor
-  D7 [MED]    computer_use tool in tool registry increases Groq prompt size by ~200
-              tokens (schema). Watch ctx window usage on Groq 8k models.
-  D8 [LOW]    BrowserAgent imported lazily inside _tool_browser_agent() — if Playwright
-              not installed, error surfaces only at runtime (not startup).
-              Fix: check playwright import in build_tool_registry() and skip if missing.
+Future bug risks (pre-registered, v31 additions):
+  D1 [HIGH]   Redis unavailable → AgentState fresh each msg
+  D2 [HIGH]   Pool None/exhausted → llm_call_fn fails
+  D3 [MED]    Keyword classifier ambiguity
+  D4 [MED]    Redis state TTL not set → OOM
+  D5 [LOW]    mem_buffer unbounded
+  D6 [LOW]    strip_internal_blocks() regex anchor
+  D7 [MED]    computer_use schema inflates Groq prompt ~200 tokens
+  D8 [LOW]    BrowserAgent lazy import
 
-Tool calls used this session:
-  Github:get_file_contents x4 (react_loop, task_dispatcher, code_exec, browser_agent)
+Tool calls used this session (v31):
+  Github:get_file_contents x3
   Github:push_files x1
-  Notion:notion-fetch x1
 """
 
 from __future__ import annotations
@@ -76,6 +48,7 @@ from packages.brain.react_loop import (
     ToolRegistry,
 )
 from packages.brain.llm_router import make_provider_llm_fn
+from packages.brain.meta.engine import get_metacognition
 from packages.tools.search import tavily_search
 from packages.tools.code_exec_tool import (
     code_exec_tool,
@@ -95,10 +68,10 @@ logger = logging.getLogger(__name__)
 
 REDIS_STATE_PREFIX   = "ultron:state:"
 REDIS_MEM_BUF_PREFIX = "ultron:mem_buffer:"
-REDIS_STATE_TTL      = 3600      # always set TTL (D4)
-MEM_BUF_MAX          = 100       # max snippets before trim (D5)
+REDIS_STATE_TTL      = 3600
+MEM_BUF_MAX          = 100
 DEFAULT_MAX_ITERATIONS = 5
-GROQ_FLASH_MODE      = True      # lock True; never disable for Groq
+GROQ_FLASH_MODE      = True
 
 TASK_TYPE_KEYWORDS: dict[str, list[str]] = {
     "search": [
@@ -125,15 +98,10 @@ TASK_TYPE_KEYWORDS: dict[str, list[str]] = {
     ],
 }
 
-
-# ---------------------------------------------------------------------------
-# Internal blocks that must NEVER reach Discord
-# ---------------------------------------------------------------------------
-
 _STRIP_PATTERNS = [
-    re.compile(r"^=== MEMORY GRAPH ===[\s\S]*?(?=^===|\Z)", re.MULTILINE),
-    re.compile(r"^\[COMPACTED HISTORY SUMMARY\][\s\S]*?(?=^\[|\Z)", re.MULTILINE),
-    re.compile(r"^\[OBSERVATION\][\s\S]*?(?=^\[|\Z)", re.MULTILINE),
+    re.compile(r"^=== MEMORY GRAPH ===.*?(?=^===|\Z)", re.MULTILINE | re.DOTALL),
+    re.compile(r"^\[COMPACTED HISTORY SUMMARY\].*?(?=^\[|\Z)", re.MULTILINE | re.DOTALL),
+    re.compile(r"^\[OBSERVATION\].*?(?=^\[|\Z)", re.MULTILINE | re.DOTALL),
     re.compile(r"^\[LOOP WARNING\].*$", re.MULTILINE),
     re.compile(r"^\[TOOL (ERROR|RESULT|OK)\].*$", re.MULTILINE),
 ]
@@ -146,11 +114,10 @@ def strip_internal_blocks(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Browser fetch tool (inline — no Playwright dependency)
+# Browser tools
 # ---------------------------------------------------------------------------
 
 async def _tool_browser_fetch(params: dict) -> ActionResult:
-    """Lightweight URL text fetch (no JS rendering, no screenshots)."""
     url = params.get("url", "")
     if not url or not url.startswith(("http://", "https://")):
         return ActionResult(success=False, error="browser_fetch: invalid or missing url")
@@ -160,23 +127,18 @@ async def _tool_browser_fetch(params: dict) -> ActionResult:
             resp.raise_for_status()
             text = re.sub(r"<[^>]+>", " ", resp.text)
             text = re.sub(r"\s+", " ", text).strip()[:3000]
-            return ActionResult(
-                extracted_content=text,
-                long_term_memory=f"fetched:{url}",
-            )
+            return ActionResult(extracted_content=text, long_term_memory=f"fetched:{url}")
     except Exception as exc:
-        logger.error(f"[browser_fetch] {url}: {exc}")
         return ActionResult(success=False, error=str(exc)[:300])
 
 
 async def _tool_browser_agent(params: dict) -> ActionResult:
-    """Full Playwright BrowserAgent for JS-rendered pages. Lazy import."""
     task = params.get("task", params.get("url", ""))
     if not task:
         return ActionResult(success=False, error="browser_agent: 'task' param required")
     try:
-        from packages.tools.browser_agent import BrowserAgent  # D8: lazy import
-        agent = BrowserAgent(llm_fn=params.get("_llm_fn"))  # injected by dispatcher
+        from packages.tools.browser_agent import BrowserAgent
+        agent = BrowserAgent(llm_fn=params.get("_llm_fn"))
         result_str = await agent.run(task)
         return ActionResult(
             extracted_content=result_str,
@@ -185,22 +147,22 @@ async def _tool_browser_agent(params: dict) -> ActionResult:
     except ImportError:
         return ActionResult(
             success=False,
-            error="browser_agent: playwright not installed (D8). pip install playwright && playwright install chromium",
+            error="browser_agent: playwright not installed (D8).",
         )
     except Exception as exc:
         return ActionResult(success=False, error=str(exc)[:300])
 
 
 # ---------------------------------------------------------------------------
-# Tool schemas for search + browser tools
+# Tool schemas
 # ---------------------------------------------------------------------------
 
 SEARCH_SCHEMA: dict = {
-    "description": "Search the web for current information. Use for news, facts, prices, people.",
+    "description": "Search the web for current information.",
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Search query, max 100 chars"},
+            "query":       {"type": "string", "description": "Search query, max 100 chars"},
             "max_results": {"type": "integer", "description": "Results count (1-10)", "default": 5},
         },
         "required": ["query"],
@@ -208,22 +170,22 @@ SEARCH_SCHEMA: dict = {
 }
 
 BROWSER_FETCH_SCHEMA: dict = {
-    "description": "Fetch plain text from a URL. For reading articles, documentation pages.",
+    "description": "Fetch plain text from a URL.",
     "parameters": {
         "type": "object",
         "properties": {
-            "url": {"type": "string", "description": "Full URL starting http:// or https://"},
+            "url": {"type": "string", "description": "Full URL http:// or https://"},
         },
         "required": ["url"],
     },
 }
 
 BROWSER_AGENT_SCHEMA: dict = {
-    "description": "Full browser automation for JS-heavy pages. Slower — prefer browser_fetch for simple pages.",
+    "description": "Full browser automation for JS-heavy pages.",
     "parameters": {
         "type": "object",
         "properties": {
-            "task": {"type": "string", "description": "Browser task description or URL to interact with"},
+            "task": {"type": "string", "description": "Task description or URL"},
         },
         "required": ["task"],
     },
@@ -231,49 +193,27 @@ BROWSER_AGENT_SCHEMA: dict = {
 
 
 # ---------------------------------------------------------------------------
-# ToolRegistry factory — ALL tools registered here
+# ToolRegistry factory
 # ---------------------------------------------------------------------------
 
 def build_tool_registry(llm_fn: Any = None) -> ToolRegistry:
-    """Build ToolRegistry with all V4 tools.
-
-    Tools:
-      search         — Tavily + DDG fallback (REAL)
-      code_exec      — subprocess Python execution (REAL)
-      shell_exec     — subprocess shell execution (REAL)
-      browser_fetch  — httpx URL text fetch (REAL)
-      browser_agent  — Playwright full automation (REAL, lazy import)
-      file_ops       — sandboxed workspace file operations (REAL)
-      computer_use   — OS screenshot + mouse/keyboard automation (REAL)
-    """
     registry = ToolRegistry()
-
-    # Search
-    registry.register("search", tavily_search, SEARCH_SCHEMA)
-
-    # Code execution (REAL — replaces stub)
-    registry.register("code_exec", code_exec_tool, CODE_EXEC_SCHEMA)
-    registry.register("shell_exec", shell_exec_tool, SHELL_EXEC_SCHEMA)
-
-    # Browser
-    registry.register("browser_fetch", _tool_browser_fetch, BROWSER_FETCH_SCHEMA)
-    registry.register("browser_agent", _tool_browser_agent, BROWSER_AGENT_SCHEMA)
-
-    # File ops (REAL — v28)
+    registry.register("search",         tavily_search,       SEARCH_SCHEMA)
+    registry.register("code_exec",      code_exec_tool,      CODE_EXEC_SCHEMA)
+    registry.register("shell_exec",     shell_exec_tool,     SHELL_EXEC_SCHEMA)
+    registry.register("browser_fetch",  _tool_browser_fetch, BROWSER_FETCH_SCHEMA)
+    registry.register("browser_agent",  _tool_browser_agent, BROWSER_AGENT_SCHEMA)
     register_file_ops(registry)
-
-    # Computer use (REAL — v29)
     register_computer_use(registry)
-
     logger.info(
-        f"[ToolRegistry] registered {len(registry.tool_names)} tools: "
+        f"[ToolRegistry] {len(registry.tool_names)} tools: "
         f"{', '.join(registry.tool_names)}"
     )
     return registry
 
 
 # ---------------------------------------------------------------------------
-# Task-type pre-classifier
+# Task classifier
 # ---------------------------------------------------------------------------
 
 def classify_task(message: str) -> str:
@@ -288,7 +228,7 @@ def classify_task(message: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Redis AgentState persistence
+# Redis helpers
 # ---------------------------------------------------------------------------
 
 async def _load_state(redis_client: Any, channel_id: str) -> Optional[dict]:
@@ -328,7 +268,7 @@ async def _buffer_memory(redis_client: Any, user_id: str, snippet: str) -> None:
     try:
         key = f"{REDIS_MEM_BUF_PREFIX}{user_id}"
         await redis_client.rpush(key, snippet)
-        await redis_client.ltrim(key, -MEM_BUF_MAX, -1)  # D5
+        await redis_client.ltrim(key, -MEM_BUF_MAX, -1)
     except Exception as exc:
         logger.warning(f"[TaskDispatcher] mem_buffer write failed: {exc}")
 
@@ -348,11 +288,12 @@ class TaskDispatcher:
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         flash_mode: bool = GROQ_FLASH_MODE,
     ) -> None:
-        self.pool          = pool
-        self.redis         = redis
-        self.settings      = settings
+        self.pool           = pool
+        self.redis          = redis
+        self.settings       = settings
         self.max_iterations = max_iterations
-        self.flash_mode    = flash_mode
+        self.flash_mode     = flash_mode
+        self._metacog       = get_metacognition()
 
     async def dispatch(
         self,
@@ -369,6 +310,17 @@ class TaskDispatcher:
             f"task_type={task_type} msg='{message[:60]}'"
         )
 
+        # ── Metacognition: pre-action assessment ───────────────────────────
+        pre = await self._metacog.pre_action_assessment(
+            action=message,
+            context={"channel_id": channel_id, "task_type": task_type},
+        )
+        logger.info(
+            f"[Metacog] mode={pre['mode']} confidence={pre['confidence']} "
+            f"approach={pre['recommended_approach']}"
+        )
+        # ──────────────────────────────────────────────────────────────────
+
         # Load persisted context
         persisted = await _load_state(self.redis, channel_id)
         initial_context = context
@@ -382,6 +334,9 @@ class TaskDispatcher:
         llm_call_fn = await make_provider_llm_fn(self.pool)
         registry    = build_tool_registry(llm_fn=llm_call_fn)
 
+        # Wire LLM callback into metacog for deep reflection calls (MC4 guard)
+        self._metacog.set_llm_callback(llm_call_fn)
+
         loop = ReActLoop(
             llm_call_fn=llm_call_fn,
             tool_registry=registry,
@@ -390,11 +345,13 @@ class TaskDispatcher:
         )
 
         final_result: Optional[ActionResult] = None
+        success = False
         try:
             final_result = await loop.run(
                 task=message,
                 initial_context=initial_context,
             )
+            success = final_result.success if final_result else False
         except Exception as exc:
             logger.exception(f"[TaskDispatcher] ReActLoop raised: {exc}")
             final_result = ActionResult(
@@ -414,6 +371,22 @@ class TaskDispatcher:
             await _save_state(self.redis, channel_id, _state)
             if final_result and final_result.long_term_memory:
                 await _buffer_memory(self.redis, user_id, final_result.long_term_memory)
+
+        # ── Metacognition: post-action reflection ──────────────────────────
+        outcome_text = (
+            final_result.extracted_content
+            if final_result and final_result.extracted_content
+            else (final_result.error if final_result else "no output")
+        ) or "no output"
+        asyncio.create_task(
+            self._metacog.post_action_reflection(
+                action=message,
+                outcome=outcome_text,
+                success=success,
+                context={"channel_id": channel_id},
+            )
+        )  # non-blocking — don't delay response
+        # ──────────────────────────────────────────────────────────────────
 
         if final_result is None or (not final_result.success and final_result.error):
             response = "Sorry, I ran into an issue completing that task." + (
