@@ -3,6 +3,18 @@ packages/brain/main.py
 
 Ultron V4 — FastAPI Brain Entrypoint
 ======================================
+v32 update:
+  Registered eternal_loop_router (APIRouter) with prefix="" — adds:
+    POST /llm/generate
+    POST /task/decompose
+    POST /task/deliver
+    POST /task/update_context
+    POST /sentinel/review
+    POST /sentinel/log
+    POST /sentinel/alert
+    POST /sentinel/migrate_context
+    POST /keys/rotate
+
 v31 update:
   Step 5e: get_metacognition() init — MetacognitionEngine singleton
   Step 5f: StructuredStore (Supabase Tier4) init — graceful degrade
@@ -34,14 +46,25 @@ Endpoints:
   GET  /rd/history/{id}    — R&D history
   GET  /infra/events       — SpacePromoter events
   GET  /metacog/state      — MetacognitionEngine state [v31]
+  --- v32 Eternal Loop endpoints (via eternal_loop_router) ---
+  POST /llm/generate             — raw role-injected LLM call
+  POST /task/decompose           — HTN plan decomposition
+  POST /task/deliver             — store result + notify Discord
+  POST /task/update_context      — inject loop context to Redis+RAPTOR
+  POST /sentinel/review          — Sentinel quality gate (Gemini 2.5 Pro)
+  POST /sentinel/log             — health log to Redis
+  POST /sentinel/alert           — Discord webhook alert
+  POST /sentinel/migrate_context — Redis STM dump → Zilliz compress → reload
+  POST /keys/rotate              — rotate exhausted provider keys
 
 Future bug risks (pre-registered, v31 additions):
   All existing M1-M9, CL1-CL6 apply.
   SB1 [HIGH] Supabase client is sync — wrapped in asyncio.to_thread(). See tier4_supabase.py.
   MC2 [MED]  post_action_reflection concurrent dict mutation — asyncio.Lock in metacog.
+  EL1-EL6    See eternal_loop_router.py.
 
-Tool calls used writing this file (v31):
-  Github:get_file_contents x1 (main.py)
+Tool calls used writing this file (v32):
+  Github:get_file_contents x4 (main.py, task_dispatcher.py, llm_router.py, planner.py)
   Github:push_files x1 (batch commit)
 """
 
@@ -73,6 +96,7 @@ from packages.brain.meta.engine import get_metacognition
 from packages.shared.config import get_settings
 from packages.shared.exceptions import AllKeysExhaustedError, SentinelKeyUnavailableError
 from packages.infrastructure.space_promoter import SpacePromoter
+from packages.brain.eternal_loop_router import router as eternal_loop_router  # v32
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -405,6 +429,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# v32: Eternal Loop + Sentinel CEO endpoints
+app.include_router(eternal_loop_router)
+
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
@@ -452,6 +479,7 @@ async def health(request: Request) -> JSONResponse:
         "planner_active":   hasattr(request.app.state, "planner"),
         "metacog_active":   hasattr(request.app.state, "metacog"),
         "tier4_connected":  tier4_connected,
+        "eternal_loop_active": True,  # v32
         "promoter":         promoter_status,
         "pool": {
             "general_available":  pool_status["general_available"],
