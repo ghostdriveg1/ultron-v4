@@ -3,6 +3,12 @@ packages/brain/main.py
 
 Ultron V4 — FastAPI Brain Entrypoint
 ======================================
+v33 update:
+  Fixed import: packages.brain.key_rotation.config_loader → packages.brain.config_loader
+  Fixed pool init: build_pool_config(settings) → get_pool() (singleton from config_loader)
+  Fixed sentinel llm fn: get_sentinel_llm_fn() from config_loader
+  All 8 providers now loaded via config_loader bridge.
+
 v32 update:
   Registered eternal_loop_router (APIRouter) with prefix="" — adds:
     POST /llm/generate
@@ -21,8 +27,9 @@ v31 update:
   New endpoint: GET /metacog/state — cognitive state dashboard
 
 Startup sequence:
-  1. Settings validated
-  2. KeyPool built (now 8 providers: +SambaNova +Fireworks +HF)
+  1. Settings validated (get_settings())
+  2. KeyPool built via get_pool() — 8 providers: Groq/Cerebras/Together/OpenRouter/Gemini/
+     SambaNova/Fireworks/HF + Sentinel
   3. TaskDispatcher (metacog wired inside)
   4. Memory pipeline: Embedder + ZillizStore + RaptorTree + MemoryWorker
   5. LifecycleEngine + GroundTruthStore + RDLoop
@@ -57,15 +64,19 @@ Endpoints:
   POST /sentinel/migrate_context — Redis STM dump → Zilliz compress → reload
   POST /keys/rotate              — rotate exhausted provider keys
 
-Future bug risks (pre-registered, v31 additions):
-  All existing M1-M9, CL1-CL6 apply.
+Future bug risks (pre-registered):
+  M1 [HIGH]  single-worker uvicorn only. Multi-worker breaks KeyPool in-memory state.
+  M2 [MED]   aioredis cross-loop risk if redis created in different event loop.
+  M9 [MED]   PlannerAgent concurrent decompose — _plan_semaphore(1) guards.
   SB1 [HIGH] Supabase client is sync — wrapped in asyncio.to_thread(). See tier4_supabase.py.
   MC2 [MED]  post_action_reflection concurrent dict mutation — asyncio.Lock in metacog.
-  EL1-EL6    See eternal_loop_router.py.
+  EL1-EL6   See eternal_loop_router.py.
+  CL7 [HIGH] get_pool() lru_cache frozen after first call — don't reinit mid-run.
+  CL8 [MED]  KeyPoolConfigError propagates from get_pool() — caught in lifespan step 2.
 
-Tool calls used writing this file (v32):
-  Github:get_file_contents x4 (main.py, task_dispatcher.py, llm_router.py, planner.py)
-  Github:push_files x1 (batch commit)
+Tool calls used writing this file (v33):
+    Github:get_file_contents x1 (main.py)
+    Github:push_files x1 (batch commit)
 """
 
 from __future__ import annotations
@@ -87,7 +98,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from packages.brain.key_rotation.config_loader import build_pool_config
+# v33: corrected import path + singleton pattern
+from packages.brain.config_loader import get_pool, get_sentinel_llm_fn
 from packages.brain.key_rotation.pool import KeyPool
 from packages.brain.task_dispatcher import TaskDispatcher
 from packages.brain.llm_router import make_provider_llm_fn
@@ -194,10 +206,22 @@ async def lifespan(app: FastAPI):
         logger.critical(f"[Startup] Settings FAILED: {e}")
         raise
 
-    # Step 2-3: KeyPool + TaskDispatcher
-    pool_config = build_pool_config(settings)
-    pool        = KeyPool(pool_config)
-    dispatcher  = TaskDispatcher(pool=pool, settings=settings)
+    # Step 2: KeyPool via config_loader singleton (v33 fix)
+    # get_pool() reads Settings internally — no args needed.
+    # CL8: KeyPoolConfigError propagates here if zero keys configured.
+    try:
+        pool = get_pool()
+        logger.info(
+            f"[Startup] KeyPool: ACTIVE — "
+            f"{len(pool.general)} general keys, "
+            f"{len(pool.sentinel)} sentinel keys."
+        )
+    except Exception as e:
+        logger.critical(f"[Startup] KeyPool FAILED: {e}")
+        raise
+
+    # Step 3: TaskDispatcher
+    dispatcher = TaskDispatcher(pool=pool, settings=settings)
 
     _brain_url = (
         "https://ghostdrive1-ultron1.hf.space"
@@ -216,10 +240,10 @@ async def lifespan(app: FastAPI):
     if zilliz_uri and zilliz_token and redis_url:
         try:
             import redis.asyncio as aioredis
-            from packages.memory.embedder    import Embedder
+            from packages.memory.embedder     import Embedder
             from packages.memory.tier2_zilliz import ZillizStore
-            from packages.memory.raptor      import RaptorTree
-            from packages.memory.worker      import MemoryWorker
+            from packages.memory.raptor       import RaptorTree
+            from packages.memory.worker       import MemoryWorker
 
             redis_client  = aioredis.from_url(redis_url, decode_responses=False)
             embedder      = Embedder()
@@ -228,11 +252,11 @@ async def lifespan(app: FastAPI):
             raptor_tree   = RaptorTree(embedder=embedder, zilliz_store=zilliz_store, llm_fn=llm_fn)
             mem_worker    = MemoryWorker(redis=redis_client, embedder=embedder, raptor_tree=raptor_tree)
 
-            memory_worker_task    = asyncio.create_task(mem_worker.run())
-            app.state.embedder    = embedder
+            memory_worker_task     = asyncio.create_task(mem_worker.run())
+            app.state.embedder     = embedder
             app.state.zilliz_store = zilliz_store
-            app.state.raptor_tree = raptor_tree
-            app.state.redis       = redis_client
+            app.state.raptor_tree  = raptor_tree
+            app.state.redis        = redis_client
             logger.info("[Startup] Memory pipeline: ACTIVE")
         except Exception as e:
             logger.warning(f"[Startup] Memory pipeline init failed (non-fatal): {e}")
@@ -320,10 +344,12 @@ async def lifespan(app: FastAPI):
         logger.warning(f"[Startup] StructuredStore init failed (non-fatal): {e}")
 
     # Step 6: Sentinel
+    # v33: use get_sentinel_llm_fn() from config_loader instead of build_sentinel(settings)
     sentinel = None
     try:
         from packages.brain.sentinel import build_sentinel
-        sentinel = build_sentinel(settings)
+        sentinel_fn = get_sentinel_llm_fn()   # None if no GEMINI_SENTINEL_KEY (CL10)
+        sentinel = build_sentinel(settings, sentinel_llm_fn=sentinel_fn)
         if sentinel:
             logger.info("[Startup] Sentinel: ACTIVE (Gemini 2.5 Pro)")
         else:
