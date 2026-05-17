@@ -1,31 +1,36 @@
 """
 packages/shared/config.py
 
-Ultron V4 — Centralised Settings (Pydantic v2 BaseSettings)
-=============================================================
+Ultron V4 — Centralised Settings (plain Python, no Pydantic dependency)
+=========================================================================
 Single source of truth for ALL environment variables across every V4 module.
 
 Usage (anywhere in codebase):
     from packages.shared.config import get_settings
     s = get_settings()          # cached singleton, zero re-parse cost
     s.groq_keys                 # list[str]
+    s.sambanova_keys            # list[str]  (v33 addition)
     s.redis_url                 # str
 
 Environment variable naming convention:
-    GROQ_KEY_0, GROQ_KEY_1, ...   (indexed, parsed into list)
+    GROQ_KEY_0, GROQ_KEY_1, ...       (indexed, parsed into list)
     CEREBRAS_KEY_0, ...
     TOGETHER_KEY_0, ...
     OPENROUTER_KEY_0, ...
-    GEMINI_KEY_0, ...             (general pool)
-    GEMINI_SENTINEL_KEY            (sentinel pool — dedicated, never shared)
+    GEMINI_KEY_0, ...                  (general pool)
+    SAMBANOVA_KEY_0, ...               (v33 — SambaNova Cloud)
+    FIREWORKS_KEY_0, ...               (v33 — Fireworks AI)
+    HF_KEY_0, ...                      (v33 — HuggingFace Inference API)
+    GEMINI_SENTINEL_KEY                (sentinel pool — dedicated, never shared)
     REDIS_URL
     ZILLIZ_URI, ZILLIZ_TOKEN
     SUPABASE_URL, SUPABASE_KEY
-    DISCORD_TOKEN                  (optional — bot inactive if unset)
+    DISCORD_TOKEN                      (optional — bot inactive if unset)
     CF_KV_API_TOKEN, CF_ACCOUNT_ID, CF_KV_NAMESPACE_ID
-    ULTRON_AUTH_TOKEN              (brain ↔ CF Worker shared secret)
-    TAVILY_API_KEY                 (search tool — free tier)
-    BRAIN_PORT                     (default 7860 for HF Spaces)
+    ULTRON_AUTH_TOKEN                  (brain ↔ CF Worker shared secret)
+    TAVILY_API_KEY                     (search tool — free tier)
+    PARALLEL_AI_KEY_0, ...             (v33 — Parallel AI search, indexed)
+    BRAIN_PORT                         (default 7860 for HF Spaces)
 
 Startup validation:
     get_settings() raises on first call if any REQUIRED var is missing.
@@ -42,9 +47,8 @@ Future bug risks (pre-registered):
               Config logs a WARNING but does NOT raise — Sentinel is optional.
               Any file that calls get_sentinel_key() MUST handle SentinelKeyUnavailableError.
 
-  S3 [MED]    Pydantic v1 vs v2: model_config vs class Config. This file uses v2.
-              If HF Space has pydantic<2 pinned, all BaseSettings calls break silently.
-              Fix: pin pydantic>=2.0 in requirements.txt.
+  S3 [MED]    Pydantic v1 vs v2 irrelevant — this file uses pure Python dataclass.
+              No pydantic dependency. Safe on any Python 3.9+.
 
   S4 [MED]    _parse_indexed_keys reads MAX_KEYS_PER_PROVIDER=20 slots.
               If Ghost adds key_21, it will be silently ignored.
@@ -54,9 +58,14 @@ Future bug risks (pre-registered):
               If Ghost rotates a key in HF Space secrets mid-run, change won't be seen
               until process restart. This is intentional — document it clearly.
 
-Tool calls used writing this file:
-    Github:get_file_contents x1 (pool.py — to confirm KeyPool config format)
-    Github:get_file_contents (litellm proxy_server.py — startup/config patterns)
+  S6 [LOW]    PARALLEL_AI_KEY indexed like LLM keys but used in search.py only.
+              Config parses them here for consistency; search.py reads via get_settings().
+
+Tool calls used writing this file (v33):
+    Github:get_file_contents x1 (config.py)
+    Github:get_file_contents x1 (pool.py)
+    Github:get_file_contents x1 (llm_router.py)
+    Github:push_files x1 (batch commit)
 """
 
 from __future__ import annotations
@@ -76,12 +85,15 @@ MAX_KEYS_PER_PROVIDER = 20
 # ---------------------------------------------------------------------------
 
 PROVIDER_DEFAULT_MODELS: dict[str, str] = {
-    "groq":       "llama-3.3-70b-versatile",
-    "cerebras":   "llama3.1-70b",
-    "together":   "meta-llama/Llama-3-70b-chat-hf",
-    "openrouter": "mistralai/mistral-7b-instruct",
-    "gemini":     "gemini-2.0-flash",
-    "gemini_sentinel": "gemini-2.5-pro-preview-03-25",
+    "groq":             "llama-3.3-70b-versatile",
+    "cerebras":         "llama3.1-70b",
+    "together":         "meta-llama/Llama-3-70b-chat-hf",
+    "openrouter":       "mistralai/mistral-7b-instruct",
+    "gemini":           "gemini-2.0-flash",
+    "gemini_sentinel":  "gemini-2.5-pro-preview-03-25",
+    "sambanova":        "Meta-Llama-3.1-70B-Instruct",
+    "fireworks":        "accounts/fireworks/models/llama-v3p3-70b-instruct",
+    "hf":               "meta-llama/Llama-3.3-70B-Instruct",
 }
 
 
@@ -90,10 +102,10 @@ PROVIDER_DEFAULT_MODELS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 def _parse_indexed_keys(prefix: str) -> list[str]:
-    """Scan env vars GROQ_KEY_0 … GROQ_KEY_N. Return stripped, non-empty values.
+    """Scan env vars PREFIX_0 … PREFIX_N. Return stripped, non-empty values.
 
     Bug S1: strip() on every key — HF Space sometimes injects trailing whitespace.
-    Bug S4: stops at MAX_KEYS_PER_PROVIDER — raise if you need more.
+    Bug S4: stops at MAX_KEYS_PER_PROVIDER — raise MAX if you need more than 20.
     """
     keys: list[str] = []
     for i in range(MAX_KEYS_PER_PROVIDER):
@@ -119,25 +131,31 @@ def _optional(name: str, default: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Settings dataclass (no Pydantic dependency — plain Python for portability)
+# Settings class
 # ---------------------------------------------------------------------------
 
 class Settings:
     """
     Parsed + validated settings. Instantiated once via get_settings().
-    All fields are read-only after construction (no setattr enforcement,
-    but treat them as immutable — bug S5).
+    All fields are read-only after construction.
     """
 
-    # LLM keys — general pool
-    groq_keys:       list[str]
-    cerebras_keys:   list[str]
-    together_keys:   list[str]
-    openrouter_keys: list[str]
-    gemini_keys:     list[str]   # general-pool Gemini keys (NOT sentinel)
+    # LLM keys — general pool (8 providers)
+    groq_keys:        list[str]
+    cerebras_keys:    list[str]
+    together_keys:    list[str]
+    openrouter_keys:  list[str]
+    gemini_keys:      list[str]   # general-pool Gemini (NOT sentinel)
+    sambanova_keys:   list[str]   # v33
+    fireworks_keys:   list[str]   # v33
+    hf_keys:          list[str]   # v33
 
     # LLM keys — sentinel pool
     gemini_sentinel_key: Optional[str]   # None if not configured (S2)
+
+    # Search
+    tavily_api_key:    str
+    parallel_ai_keys:  list[str]  # v33 — Parallel AI search (indexed)
 
     # Infrastructure
     redis_url:          str
@@ -146,7 +164,7 @@ class Settings:
     supabase_url:       str
     supabase_key:       str
 
-    # Discord — optional, bot skipped if unset
+    # Discord — optional
     discord_token: Optional[str]
 
     # Cloudflare
@@ -157,21 +175,21 @@ class Settings:
     # Auth
     ultron_auth_token: str
 
-    # Search
-    tavily_api_key: str
-
     # Server
     brain_port: int
 
     def __init__(self) -> None:
-        # ── LLM keys ──────────────────────────────────────────────────────
+        # ── LLM keys — general pool ────────────────────────────────────────
         self.groq_keys       = _parse_indexed_keys("GROQ_KEY")
         self.cerebras_keys   = _parse_indexed_keys("CEREBRAS_KEY")
         self.together_keys   = _parse_indexed_keys("TOGETHER_KEY")
         self.openrouter_keys = _parse_indexed_keys("OPENROUTER_KEY")
         self.gemini_keys     = _parse_indexed_keys("GEMINI_KEY")
+        self.sambanova_keys  = _parse_indexed_keys("SAMBANOVA_KEY")   # v33
+        self.fireworks_keys  = _parse_indexed_keys("FIREWORKS_KEY")   # v33
+        self.hf_keys         = _parse_indexed_keys("HF_KEY")          # v33
 
-        # Sentinel key — optional, warn if missing
+        # ── Sentinel key — optional ────────────────────────────────────────
         _sentinel_raw = _optional("GEMINI_SENTINEL_KEY")
         self.gemini_sentinel_key = _sentinel_raw if _sentinel_raw else None
         if not self.gemini_sentinel_key:
@@ -181,11 +199,12 @@ class Settings:
                 "Set it in HF Space secrets when ready."
             )
 
-        # ── Validate: at least one general pool key must exist ─────────────
+        # ── Validate: at least one general pool key ────────────────────────
         total_general = (
             len(self.groq_keys) + len(self.cerebras_keys)
             + len(self.together_keys) + len(self.openrouter_keys)
-            + len(self.gemini_keys)
+            + len(self.gemini_keys) + len(self.sambanova_keys)
+            + len(self.fireworks_keys) + len(self.hf_keys)
         )
         if total_general == 0:
             raise RuntimeError(
@@ -208,7 +227,7 @@ class Settings:
         if not self.supabase_url:
             logger.warning("[Config] SUPABASE_URL not set — Supabase structured memory inactive.")
 
-        # ── Discord — OPTIONAL, bot skipped if unset ───────────────────────
+        # ── Discord — OPTIONAL ─────────────────────────────────────────────
         _discord_raw = _optional("DISCORD_TOKEN")
         self.discord_token = _discord_raw if _discord_raw else None
         if not self.discord_token:
@@ -233,9 +252,10 @@ class Settings:
             )
 
         # ── Search ─────────────────────────────────────────────────────────
-        self.tavily_api_key = _optional("TAVILY_API_KEY")
-        if not self.tavily_api_key:
-            logger.warning("[Config] TAVILY_API_KEY not set — search tool will be inactive.")
+        self.tavily_api_key   = _optional("TAVILY_API_KEY")
+        self.parallel_ai_keys = _parse_indexed_keys("PARALLEL_AI_KEY")  # v33 S6
+        if not self.tavily_api_key and not self.parallel_ai_keys:
+            logger.warning("[Config] No search keys (TAVILY_API_KEY or PARALLEL_AI_KEY_0) — search inactive.")
 
         # ── Server ─────────────────────────────────────────────────────────
         port_str = _optional("BRAIN_PORT", "7860")
@@ -247,12 +267,21 @@ class Settings:
 
         # ── Summary log (no key values ever printed) ───────────────────────
         logger.info(
-            f"[Config] Loaded. General pool: groq={len(self.groq_keys)} "
-            f"cerebras={len(self.cerebras_keys)} together={len(self.together_keys)} "
-            f"openrouter={len(self.openrouter_keys)} gemini={len(self.gemini_keys)} "
-            f"total={total_general}. Sentinel={'YES' if self.gemini_sentinel_key else 'NO'}. "
+            f"[Config] Loaded. General pool: "
+            f"groq={len(self.groq_keys)} "
+            f"cerebras={len(self.cerebras_keys)} "
+            f"together={len(self.together_keys)} "
+            f"openrouter={len(self.openrouter_keys)} "
+            f"gemini={len(self.gemini_keys)} "
+            f"sambanova={len(self.sambanova_keys)} "
+            f"fireworks={len(self.fireworks_keys)} "
+            f"hf={len(self.hf_keys)} "
+            f"total={total_general}. "
+            f"Sentinel={'YES' if self.gemini_sentinel_key else 'NO'}. "
             f"Redis={'SET' if self.redis_url else 'MISSING'}. "
-            f"Discord={'SET' if self.discord_token else 'INACTIVE'}."
+            f"Discord={'SET' if self.discord_token else 'INACTIVE'}. "
+            f"Search: tavily={'YES' if self.tavily_api_key else 'NO'} "
+            f"parallel_ai={len(self.parallel_ai_keys)}."
         )
 
 
