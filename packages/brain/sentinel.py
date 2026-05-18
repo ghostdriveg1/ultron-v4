@@ -5,6 +5,11 @@ Ultron V4 — Sentinel God Layer
 ===============================
 Authority: Highest. Never answers user queries. Only watches, decides, writes, repairs.
 
+v33 update:
+  build_sentinel() now accepts optional sentinel_llm_fn kwarg (ignored internally,
+  Sentinel still uses its own key directly). Accepts **kwargs for forward-compat.
+  This prevents crash when main.py passes sentinel_llm_fn=get_sentinel_llm_fn().
+
 Responsibilities:
   - KV routing table read/write (CF Worker routes based on this)
   - Space health checks (<50ms, every request path)
@@ -40,9 +45,13 @@ Future bug risks (pre-registered):
              can handle but API timeout=120s may be insufficient for large log sets.
              Fix: increase timeout to 240s for weekly audit call specifically.
 
-Tool calls used writing this file:
-    Github:get_file_contents x1 (ultron-v3/packages/brain/sentinel.py — reference patterns)
-    Github:get_file_contents x1 (ultron-v4/packages/brain/main.py — confirmed app.state shape)
+  S6 [LOW]   build_sentinel accepts sentinel_llm_fn kwarg but ignores it. If in future
+             we want Sentinel to use the injected fn instead of direct key, refactor
+             _call_sentinel() to delegate to it. Current: direct key always used.
+
+Tool calls used writing this file (v33):
+    Github:get_file_contents x1 (sentinel.py)
+    Github:push_files x1 (batch commit)
 """
 
 from __future__ import annotations
@@ -51,7 +60,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -521,10 +530,19 @@ class Sentinel:
 # Factory — called from main.py lifespan
 # ──────────────────────────────────────────────────────────────────────────────
 
-def build_sentinel(settings: Any) -> Optional["Sentinel"]:
+def build_sentinel(
+    settings: Any,
+    *,
+    sentinel_llm_fn: Optional[Callable] = None,  # v33: accepted, not used internally (S6)
+    **kwargs: Any,
+) -> Optional["Sentinel"]:
     """
     Build Sentinel from settings. Returns None if GEMINI_SENTINEL_KEY not set.
     Called during FastAPI lifespan — non-fatal if Sentinel unavailable.
+
+    sentinel_llm_fn: injected from config_loader.get_sentinel_llm_fn().
+    Currently ignored — Sentinel uses its key directly (S6).
+    Future: replace _call_sentinel() with this fn for testability.
     """
     import os
     sentinel_key = (
