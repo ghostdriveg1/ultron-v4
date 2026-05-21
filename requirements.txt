@@ -38,11 +38,14 @@ pymilvus==2.4.9
 umap-learn==0.5.6
 scikit-learn==1.5.2
 
+# Phase 3: MAGMA graph (magma_graph.py hard import)
+networkx>=3.3
+
 # Phase 5: Voice layer — TTS + audio
 # T3: kokoro and soundfile needed for Kokoro TTS.
 # Pre-download model weights in Dockerfile to avoid cold-start delay (T1).
 kokoro>=0.9.2
 soundfile>=0.12.1
 
-# Supabase (Phase 4 structured memory — deferred)
+# Supabase (Phase 4 structured memory — optional, graceful degrade if absent)
 # supabase==2.10.0
